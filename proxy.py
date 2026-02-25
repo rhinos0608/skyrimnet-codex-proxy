@@ -245,7 +245,8 @@ async def start_interceptor():
     logger.info(f"Interceptor on port {INTERCEPTOR_PORT}")
 
     # Use clean temp dir to minimize system-reminder bloat (no CLAUDE.md, no skills)
-    with tempfile.TemporaryDirectory() as tmpdir:
+    # ignore_cleanup_errors=True prevents Windows errors when subprocess still holds dir handle
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
         env = os.environ.copy()
         env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{INTERCEPTOR_PORT}"
 
@@ -1147,6 +1148,11 @@ async def list_models():
             {"id": "gpt-5.2-codex", "object": "model", "owned_by": "openai"},
             {"id": "gpt-5.1-codex-max", "object": "model", "owned_by": "openai"},
             {"id": "gpt-5.1-codex-mini", "object": "model", "owned_by": "openai"},
+            {"id": "gpt-5.1", "object": "model", "owned_by": "openai"},
+            {"id": "gpt-5.1-codex", "object": "model", "owned_by": "openai"},
+            {"id": "gpt-5-codex", "object": "model", "owned_by": "openai"},
+            {"id": "gpt-5-codex-mini", "object": "model", "owned_by": "openai"},
+            {"id": "gpt-5", "object": "model", "owned_by": "openai"},
         ])
     if openrouter_api_key:
         data.append({"id": "openrouter/*", "object": "model", "owned_by": "openrouter"})
@@ -1202,6 +1208,11 @@ async def dashboard():
         ("gpt-5.2-codex", "GPT-5.2 Codex", "Code-optimized"),
         ("gpt-5.1-codex-max", "GPT-5.1 Max", "Long context"),
         ("gpt-5.1-codex-mini", "GPT-5.1 Mini", "Fast"),
+        ("gpt-5.1", "GPT-5.1", "General purpose"),
+        ("gpt-5.1-codex", "GPT-5.1 Codex", "Code-optimized"),
+        ("gpt-5-codex", "GPT-5 Codex", "Code-optimized"),
+        ("gpt-5-codex-mini", "GPT-5 Codex Mini", "Fast"),
+        ("gpt-5", "GPT-5", "Reasoning"),
     ]
     codex_rows = "".join(
         f'<tr><td style="font-family:monospace;color:#93c5fd">{mid}</td><td>{name}</td><td style="color:#9ca3af">{desc}</td></tr>'
@@ -1320,6 +1331,11 @@ async def dashboard():
           <option value="gpt-5.2-codex">gpt-5.2-codex</option>
           <option value="gpt-5.1-codex-max">gpt-5.1-codex-max</option>
           <option value="gpt-5.1-codex-mini">gpt-5.1-codex-mini</option>
+          <option value="gpt-5.1">gpt-5.1</option>
+          <option value="gpt-5.1-codex">gpt-5.1-codex</option>
+          <option value="gpt-5-codex">gpt-5-codex</option>
+          <option value="gpt-5-codex-mini">gpt-5-codex-mini</option>
+          <option value="gpt-5">gpt-5</option>
         </optgroup>
       </select>
     </div>
