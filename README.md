@@ -143,6 +143,10 @@ Each request cycles to the next model in the list. Models containing `/` route t
 - Web dashboard with quick test form
 - Models: Opus 4.6, Sonnet 4.5 (default), Haiku 4.5
 
+## Attribution
+
+This project builds on [Claude-SkyrimNet-Proxy](https://github.com/galanx/Claude-SkyrimNet-Proxy) by [@galanx](https://github.com/galanx), with the addition of the `/v1/codex` endpoint for code generation support.
+
 ## License
 
 MIT
