@@ -69,7 +69,9 @@ def _get_codex_command() -> tuple[str, list[str]]:
 
     # On Windows, .cmd/.bat files must be run through cmd.exe
     if sys.platform == "win32" and CODEX_PATH.lower().endswith((".cmd", ".bat")):
-        return ("cmd.exe", ["/c", CODEX_PATH])
+        # Use full path to cmd.exe to ensure it's found regardless of cwd
+        cmd_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+        return (cmd_exe, ["/c", CODEX_PATH])
 
     return (CODEX_PATH, [])
 
@@ -706,6 +708,7 @@ async def call_codex_direct(
         isolated_home, env = _create_isolated_codex_home()
 
         executable, prefix_args = _get_codex_command()
+        logger.info(f"[{request_id}] Executing: {executable} {' '.join(prefix_args)} exec --model {model}")
         proc = await asyncio.create_subprocess_exec(
             executable,
             *prefix_args,
@@ -714,13 +717,16 @@ async def call_codex_direct(
             "--json",
             "--dangerously-bypass-approvals-and-sandbox",
             "--ephemeral",
-            full_prompt,
+            "-",  # Read prompt from stdin
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=isolated_home,  # Run from isolated directory
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=full_prompt.encode("utf-8")), timeout=180
+        )
         elapsed = time.time() - start
 
         if proc.returncode != 0:
@@ -814,7 +820,8 @@ async def call_codex_streaming(
             "--json",
             "--dangerously-bypass-approvals-and-sandbox",
             "--ephemeral",
-            full_prompt,
+            "-",  # Read prompt from stdin
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
@@ -822,7 +829,9 @@ async def call_codex_streaming(
         )
 
         # Collect all output first (Codex CLI buffers output)
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=full_prompt.encode("utf-8")), timeout=180
+        )
         elapsed = time.time() - start
 
         if proc.returncode != 0:
