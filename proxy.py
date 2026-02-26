@@ -21,6 +21,7 @@ import uuid
 import logging
 import shutil
 import os
+import sys
 import copy
 import tempfile
 from contextlib import asynccontextmanager
@@ -53,6 +54,24 @@ if CODEX_PATH:
     logger.info(f"Using Codex CLI: {CODEX_PATH}")
 else:
     logger.warning("Codex CLI not found on PATH - Codex provider unavailable")
+
+
+def _get_codex_command() -> tuple[str, list[str]]:
+    """
+    Get the correct command to run Codex CLI on the current platform.
+
+    On Windows, .cmd files need to be executed through cmd.exe.
+    Returns (executable, prefix_args) where prefix_args are additional args
+    that go before the codex arguments.
+    """
+    if not CODEX_PATH:
+        return ("", [])
+
+    # On Windows, .cmd/.bat files must be run through cmd.exe
+    if sys.platform == "win32" and CODEX_PATH.lower().endswith((".cmd", ".bat")):
+        return ("cmd.exe", ["/c", CODEX_PATH])
+
+    return (CODEX_PATH, [])
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -686,8 +705,10 @@ async def call_codex_direct(
         # Create isolated HOME with clean config
         isolated_home, env = _create_isolated_codex_home()
 
+        executable, prefix_args = _get_codex_command()
         proc = await asyncio.create_subprocess_exec(
-            CODEX_PATH,
+            executable,
+            *prefix_args,
             "exec",
             "--model", model,
             "--json",
@@ -784,8 +805,10 @@ async def call_codex_streaming(
         # Create isolated HOME with clean config
         isolated_home, env = _create_isolated_codex_home()
 
+        executable, prefix_args = _get_codex_command()
         proc = await asyncio.create_subprocess_exec(
-            CODEX_PATH,
+            executable,
+            *prefix_args,
             "exec",
             "--model", model,
             "--json",
