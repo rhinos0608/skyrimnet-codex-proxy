@@ -1341,6 +1341,130 @@ async def call_openrouter_streaming(system_prompt: Optional[str], messages: list
             await session.close()
 
 
+# --- Ollama API calls ---
+
+async def call_ollama_direct(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params) -> str:
+    """Forward request to Ollama (OpenAI-compatible), collect full response."""
+    api_model = model[len("ollama:"):]
+    if ollama_api_key:
+        endpoint = "https://ollama.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {ollama_api_key}", "Content-Type": "application/json"}
+    else:
+        endpoint = "http://localhost:11434/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+
+    oai_messages = []
+    if system_prompt:
+        oai_messages.append({"role": "system", "content": system_prompt})
+    for m in messages:
+        oai_messages.append({"role": m["role"], "content": m["content"]})
+
+    payload = {"model": api_model, "messages": oai_messages, "max_tokens": max_tokens}
+    payload.update({k: v for k, v in extra_params.items() if v is not None})
+
+    request_id = uuid.uuid4().hex[:8]
+    target = "Ollama Cloud" if ollama_api_key else f"Ollama local ({api_model})"
+    logger.info(f"[{request_id}] -> {target} ({len(messages)} msgs)")
+    start = time.time()
+
+    session = auth.session or create_session()
+    try:
+        async with session.post(endpoint, json=payload, headers=headers) as resp:
+            elapsed = time.time() - start
+            if resp.status in (401, 403):
+                raise HTTPException(status_code=401, detail="Ollama Cloud auth failed — check API key")
+            if resp.status == 429:
+                raise HTTPException(status_code=429, detail="Ollama rate limit exceeded")
+            if resp.status != 200:
+                error_body = await resp.text()
+                logger.error(f"[{request_id}] Ollama {resp.status}: {error_body[:300]}")
+                raise HTTPException(status_code=resp.status, detail=error_body[:200])
+            data = await resp.json()
+            text = data["choices"][0]["message"]["content"]
+            logger.info(f"[{request_id}] <- {len(text)} chars ({elapsed:.1f}s, Ollama)")
+            return text
+    except aiohttp.ClientConnectorError:
+        raise HTTPException(status_code=503, detail="Ollama not running at localhost:11434")
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Ollama request timed out")
+    finally:
+        if not auth.session:
+            await session.close()
+
+
+async def call_ollama_streaming(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params):
+    """Forward request to Ollama with streaming, passthrough SSE directly."""
+    api_model = model[len("ollama:"):]
+    if ollama_api_key:
+        endpoint = "https://ollama.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {ollama_api_key}", "Content-Type": "application/json"}
+    else:
+        endpoint = "http://localhost:11434/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+
+    oai_messages = []
+    if system_prompt:
+        oai_messages.append({"role": "system", "content": system_prompt})
+    for m in messages:
+        oai_messages.append({"role": m["role"], "content": m["content"]})
+
+    payload = {"model": api_model, "messages": oai_messages, "max_tokens": max_tokens, "stream": True}
+    payload.update({k: v for k, v in extra_params.items() if v is not None})
+
+    request_id = uuid.uuid4().hex[:8]
+    target = "Ollama Cloud" if ollama_api_key else f"Ollama local ({api_model})"
+    logger.info(f"[{request_id}] -> {target} ({len(messages)} msgs, stream)")
+    start = time.time()
+
+    session = auth.session or create_session()
+    owns_session = not auth.session
+    try:
+        async with session.post(endpoint, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                error_body = await resp.text()
+                logger.error(f"[{request_id}] Ollama {resp.status}: {error_body[:300]}")
+                cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+                err_chunk = {"id": cmpl_id, "object": "chat.completion.chunk",
+                             "created": int(time.time()), "model": model,
+                             "choices": [{"index": 0, "delta": {"content": f"[Ollama Error {resp.status}]"}, "finish_reason": None}]}
+                yield f"data: {json.dumps(err_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            # Ollama /v1 returns OpenAI-format SSE — passthrough directly
+            buffer = ""
+            async for raw_chunk in resp.content.iter_any():
+                buffer += raw_chunk.decode("utf-8", errors="replace")
+                while "\n\n" in buffer:
+                    event, buffer = buffer.split("\n\n", 1)
+                    event = event.strip()
+                    if event:
+                        yield event + "\n\n"
+
+            if buffer.strip():
+                yield buffer.strip() + "\n\n"
+
+            elapsed = time.time() - start
+            logger.info(f"[{request_id}] <- stream done ({elapsed:.1f}s, Ollama)")
+    except aiohttp.ClientConnectorError:
+        cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+        err_chunk = {"id": cmpl_id, "object": "chat.completion.chunk",
+                     "created": int(time.time()), "model": model,
+                     "choices": [{"index": 0, "delta": {"content": "[Ollama Error: not running at localhost:11434]"}, "finish_reason": None}]}
+        yield f"data: {json.dumps(err_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+    except asyncio.TimeoutError:
+        cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+        err_chunk = {"id": cmpl_id, "object": "chat.completion.chunk",
+                     "created": int(time.time()), "model": model,
+                     "choices": [{"index": 0, "delta": {"content": "[Ollama Error: request timed out]"}, "finish_reason": None}]}
+        yield f"data: {json.dumps(err_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        if owns_session:
+            await session.close()
+
+
 # --- Antigravity Auth Loading ---
 
 ANTIGRAVITY_AUTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "antigravity-auth.json")
