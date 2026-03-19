@@ -2014,11 +2014,14 @@ async def chat_completions(req: ChatRequest):
     model_field = req.model or DEFAULT_MODEL
     models = parse_model_list(model_field)
     model = pick_model_round_robin(models) if len(models) > 1 else models[0]
-    use_openrouter = is_openrouter_model(model)
-    use_codex = is_codex_model(model)
-    use_antigravity = is_antigravity_model(model)
+    use_ollama = is_ollama_model(model)
+    use_openrouter = not use_ollama and is_openrouter_model(model)
+    use_codex = not use_ollama and is_codex_model(model)
+    use_antigravity = not use_ollama and is_antigravity_model(model)
 
-    if use_openrouter:
+    if use_ollama:
+        pass  # No auth check — local needs none, cloud key checked inside call function
+    elif use_openrouter:
         pass  # No auth check needed for OpenRouter
     elif use_codex:
         if not codex_auth.is_ready:
@@ -2057,7 +2060,15 @@ async def chat_completions(req: ChatRequest):
     extra_params = {k: v for k, v in (req.model_extra or {}).items() if v is not None}
 
     # Route to correct provider
-    if use_openrouter:
+    if use_ollama:
+        if req.stream:
+            return StreamingResponse(
+                call_ollama_streaming(system_prompt, merged, model, max_tokens, **extra_params),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        response = await call_ollama_direct(system_prompt, merged, model, max_tokens, **extra_params)
+    elif use_openrouter:
         if req.stream:
             return StreamingResponse(
                 call_openrouter_streaming(system_prompt, merged, model, max_tokens, **extra_params),

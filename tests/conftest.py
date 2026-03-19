@@ -28,8 +28,10 @@ def proxy_module():
 
 @pytest.fixture()
 def test_client(proxy_module):
-    """FastAPI TestClient that does NOT run the lifespan (no subprocess spawning)."""
+    """FastAPI TestClient that does NOT run the lifespan (no subprocess spawning).
+
+    Instantiating TestClient without using it as a context manager skips the
+    lifespan startup/shutdown events, preventing CLI auth subprocesses from running.
+    """
     from fastapi.testclient import TestClient
-    # lifespan=False skips the startup/shutdown events (prevents CLI auth subprocesses)
-    with TestClient(proxy_module.app, raise_server_exceptions=True, lifespan=False) as client:
-        yield client
+    yield TestClient(proxy_module.app, raise_server_exceptions=True)
