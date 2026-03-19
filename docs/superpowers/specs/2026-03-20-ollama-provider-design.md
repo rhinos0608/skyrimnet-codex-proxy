@@ -1,32 +1,50 @@
 # Ollama Provider Integration — Design Spec
 
 **Date:** 2026-03-20
-**Status:** Approved
+**Status:** Approved (rev 5)
 
 ---
 
 ## Overview
 
-Add Ollama as a first-class provider in the SkyrimNet proxy, supporting both local Ollama (`http://localhost:11434`) and Ollama Cloud (`https://ollama.com/v1`) via Bearer token. The round-robin system routes requests to the correct provider based on model name — no changes to the existing round-robin logic are needed.
+Add Ollama as a first-class provider in the SkyrimNet proxy, supporting both local Ollama (`http://localhost:11434`) and Ollama Cloud (`https://ollama.com/v1`) via Bearer token. No changes to `parse_model_list` or `pick_model_round_robin` needed.
 
 ---
 
 ## Model Detection
 
-Models prefixed with `ollama:` route to Ollama. The prefix is stripped before sending to the API.
+Models prefixed with `ollama:` route to Ollama. All detection functions are called on the **original, unstripped `model` variable**. The `ollama:` prefix is stripped **inside** the call functions only.
 
 ```
-ollama:llama3.2       → sends "llama3.2" to Ollama
-ollama:mistral:7b     → sends "mistral:7b" to Ollama
-ollama:qwen3:8b       → sends "qwen3:8b" to Ollama
+ollama:llama3.2       → sends "llama3.2" to Ollama API
+ollama:mistral:7b     → sends "mistral:7b" to Ollama API
+ollama:namespace/model → sends "namespace/model" to Ollama API (slash in name is valid)
 ```
 
-Detection function:
+The `"model"` field in both streaming chunks and non-streaming responses echoes the **full original model string** (e.g., `"ollama:llama3.2"`), consistent with all other providers which return their model string unchanged.
 
 ```python
 def is_ollama_model(model: str) -> bool:
     return model.lower().startswith("ollama:")
 ```
+
+---
+
+## Routing Priority
+
+**Rewrite** all four existing detection lines in `chat_completions` (do not add a fifth — replace all four):
+
+```python
+use_ollama      = is_ollama_model(model)
+use_openrouter  = not use_ollama and is_openrouter_model(model)
+use_codex       = not use_ollama and is_codex_model(model)
+use_antigravity = not use_ollama and is_antigravity_model(model)
+# else → Claude
+```
+
+This ensures `ollama:namespace/model` (which contains `/`) is never misrouted to OpenRouter.
+
+The `if/elif` routing block order: Ollama → OpenRouter → Codex → Antigravity → Claude.
 
 ---
 
@@ -37,28 +55,7 @@ def is_ollama_model(model: str) -> bool:
 | No `ollama_api_key` configured | `http://localhost:11434/v1/chat/completions` | None |
 | `ollama_api_key` configured | `https://ollama.com/v1/chat/completions` | `Authorization: Bearer <key>` |
 
----
-
-## Round-Robin Routing (all providers)
-
-Model names in the round-robin list are detected in this priority order:
-
-1. `ollama:*` → Ollama
-2. `provider/model` (contains `/`) → OpenRouter
-3. `gpt-5.*` / `codex-*` → Codex
-4. `antigravity-*` / `gemini-3*` / `gemini-2.5*` / `gpt-oss-*` → Antigravity
-5. All others → Claude (Anthropic)
-
-Example rotation:
-
-```
-ollama:llama3.2, gpt-5.4, claude-sonnet-4-6, antigravity-gemini-2.5-pro
-```
-
-- Turn 1 → `llama3.2` on Ollama (local or cloud)
-- Turn 2 → `gpt-5.4` on Codex
-- Turn 3 → `claude-sonnet-4-6` on Claude
-- Turn 4 → `antigravity-gemini-2.5-pro` on Antigravity
+No pre-flight auth check in the routing block (same pattern as OpenRouter).
 
 ---
 
@@ -70,46 +67,99 @@ ollama:llama3.2, gpt-5.4, claude-sonnet-4-6, antigravity-gemini-2.5-pro
 ollama_api_key: Optional[str] = _cfg.get("ollama_api_key") or None
 ```
 
-Loaded from `config.json` at startup, same pattern as `openrouter_api_key`.
+JSON key in `config.json`: `"ollama_api_key"`. Loaded at startup alongside `openrouter_api_key`.
 
 ### 2. `is_ollama_model(model: str) -> bool`
 
-Added alongside the other `is_*_model` functions.
+Added immediately before `is_openrouter_model` in source order.
 
-### 3. `call_ollama_direct(...)` and `call_ollama_streaming(...)`
+### 3. `call_ollama_direct(system_prompt, messages, model, max_tokens, **extra_params) -> str`
 
-Both functions:
-- Determine endpoint: localhost or Ollama Cloud based on `ollama_api_key`
-- Set `Authorization: Bearer <key>` header if key is present
-- Send OpenAI-compatible JSON payload (no format translation needed — Ollama's `/v1/` endpoint is OpenAI-compatible)
-- Strip `ollama:` prefix from model name before sending
-- Reuse `auth.session` or create a new session
+- Strip prefix: `api_model = model[len("ollama:"):]`
+- Select endpoint and auth header based on `ollama_api_key`
+- Build `oai_messages` same way as `call_openrouter_direct`
+- Payload: `{"model": api_model, "messages": oai_messages, "max_tokens": max_tokens, **extra_params}`
+- Session: `session = auth.session or create_session()`. `auth.session` may be `None` (Ollama-only deployment with no Claude auth) — this is normal and expected. In that case `create_session()` provides an owned session. Cleanup: `if not auth.session: await session.close()` in `finally`
+- Transport and HTTP error handling (catch in this order):
+  - `aiohttp.ClientConnectorError` (connection refused, local not running) → `HTTPException(503, "Ollama not running at localhost:11434")`
+  - `asyncio.TimeoutError` → `HTTPException(504, "Ollama request timed out")`
+  - HTTP 401/403 → `HTTPException(401, "Ollama Cloud auth failed — check API key")`
+  - HTTP 429 → `HTTPException(429, "Ollama rate limit exceeded")`
+  - Other non-200 → `HTTPException(resp.status, f"Ollama error: {text[:200]}")`
 
-### 4. Routing in `chat_completions`
+### 4. `call_ollama_streaming(system_prompt, messages, model, max_tokens, **extra_params)`
 
-`use_ollama = is_ollama_model(model)` added alongside the other `use_*` flags.
-Ollama branch inserted before the Claude `else` branch.
+- Same endpoint/auth/prefix-strip logic as `call_ollama_direct`
+- Payload includes `"stream": True`, forwards `**extra_params`
+- Session: `owns_session = not auth.session` variable; `if owns_session: await session.close()` in `finally`
+- **Passthrough** of Ollama's SSE chunks directly to the client, same pattern as `call_openrouter_streaming` (not parsed and re-emitted like Claude)
+- On `aiohttp.ClientConnectorError`, `asyncio.TimeoutError`, or non-200: yield SSE error chunk then `data: [DONE]\n\n`
 
-### 5. `/config/ollama-key` POST endpoint
+### 5. Routing in `chat_completions`
 
-Same structure as `/config/openrouter-key`. Saves/clears `ollama_api_key` in `config.json`.
+Rewrite the four `use_*` lines as specified in Routing Priority. Add the Ollama branch at the top of the `if/elif` chain:
 
-### 6. Dashboard
+```python
+if use_ollama:
+    if req.stream:
+        return StreamingResponse(call_ollama_streaming(...), media_type="text/event-stream", ...)
+    response = await call_ollama_direct(...)
+elif use_openrouter:
+    ...
+```
 
-- Ollama status card: shows "Local (localhost:11434)" or "Cloud (key configured)"
-- API key input form for Ollama Cloud key (below local status)
+### 6. `/config/ollama-key` POST endpoint
 
-### 7. `/v1/models`
+Same structure as `/config/openrouter-key`. Accepts `{"key": "..."}`. Empty string or missing key clears `ollama_api_key` (sets to `None`, removes from `config.json`) — this switches the endpoint back to local mode. Non-empty key saves to `config.json` and updates the global.
 
-Attempt a quick ping to `http://localhost:11434/v1/models`; if successful, include the returned models (prefixed with `ollama:`) in the response. If unreachable, skip silently.
+### 7. `/health` endpoint
+
+Add `"ollama_configured": ollama_api_key is not None` to the health response JSON alongside existing fields.
+
+### 8. Dashboard
+
+Ollama status card with two states:
+
+- Key configured → `"Cloud (key configured)"`, color `#4ade80`
+- No key → `"Local (localhost:11434)"`, color `#64748b`
+
+API key input form below the card, same HTML pattern as the OpenRouter form, posting to `/config/ollama-key`.
+
+### 9. `/v1/models`
+
+Ping the OpenAI-compat models endpoint on local Ollama using a tight timeout:
+
+```python
+async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2, connect=1)) as s:
+    async with s.get("http://localhost:11434/v1/models") as resp:
+        if resp.status == 200:
+            data = await resp.json()
+            # OpenAI-compat format: {"object": "list", "data": [{"id": "model-name", ...}]}
+            for m in data.get("data", []):
+                ollama_models.append({
+                    "id": f"ollama:{m['id']}",
+                    "object": "model",
+                    "owned_by": "ollama",
+                })
+```
+
+On any failure (connection error, timeout, non-200), skip silently — no Ollama models added.
+
+### 10. No persistent session / no lifespan change
+
+No `ollama_session` global is added. Ollama uses the per-request `auth.session or create_session()` pattern. The `lifespan` function is unchanged.
 
 ---
 
-## Error Handling
+## Error Handling Summary
 
-- If local Ollama is unreachable: return HTTP 503 with `"Ollama not running at localhost:11434"`
-- If Ollama Cloud key is set but request fails (401/403): return HTTP 401 with `"Ollama Cloud auth failed — check API key"`
-- No fallback between local and cloud (explicit configuration)
+| Scenario | Non-streaming | Streaming |
+|----------|--------------|-----------|
+| Local unreachable (`ClientConnectorError`) | HTTP 503 | SSE error chunk + DONE |
+| Timeout (`asyncio.TimeoutError`) | HTTP 504 | SSE error chunk + DONE |
+| Cloud auth fail (401/403) | HTTP 401 | SSE error chunk + DONE |
+| Rate limit (429) | HTTP 429 | SSE error chunk + DONE |
+| Other non-200 | HTTP `resp.status` | SSE error chunk + DONE |
 
 ---
 
@@ -118,3 +168,4 @@ Attempt a quick ping to `http://localhost:11434/v1/models`; if successful, inclu
 - `parse_model_list()` — unchanged
 - `pick_model_round_robin()` — unchanged
 - All other provider call functions — unchanged
+- `lifespan` — unchanged
