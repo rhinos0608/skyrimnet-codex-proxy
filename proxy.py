@@ -2417,6 +2417,21 @@ async def list_models():
             {"id": "antigravity-claude-opus-4-6-thinking", "object": "model", "owned_by": "anthropic"},
             {"id": "antigravity-gpt-oss-120b-medium", "object": "model", "owned_by": "other"},
         ])
+    # Probe local Ollama with a short timeout — skip silently if unreachable
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=2, connect=1)
+        ) as s:
+            async with s.get("http://localhost:11434/v1/models") as ollama_resp:
+                if ollama_resp.status == 200:
+                    ollama_data = await ollama_resp.json()
+                    for m in ollama_data.get("data", []):
+                        model_id = m.get("id", "")
+                        if model_id:
+                            data.append({"id": f"ollama:{model_id}", "object": "model", "owned_by": "ollama"})
+    except Exception:
+        pass  # Ollama not running or unreachable — skip silently
+
     if openrouter_api_key:
         data.append({"id": "openrouter/*", "object": "model", "owned_by": "openrouter"})
     return {"object": "list", "data": data}
@@ -2445,6 +2460,7 @@ async def health():
             "account_count": len(accounts_info),
         },
         "openrouter_configured": openrouter_api_key is not None,
+        "ollama_configured": ollama_api_key is not None,
     }
 
 
