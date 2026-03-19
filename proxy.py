@@ -2146,6 +2146,25 @@ async def set_openrouter_key(request: Request):
     return {"status": "saved"}
 
 
+@app.post("/config/ollama-key")
+async def set_ollama_key(request: Request):
+    global ollama_api_key
+    data = await request.json()
+    key = data.get("key", "").strip()
+    cfg = _load_config()
+    if not key:
+        ollama_api_key = None
+        cfg.pop("ollama_api_key", None)
+        _save_config(cfg)
+        logger.info("Ollama API key cleared — using local endpoint (localhost:11434)")
+        return {"status": "cleared"}
+    ollama_api_key = key
+    cfg["ollama_api_key"] = key
+    _save_config(cfg)
+    logger.info("Ollama Cloud API key configured and saved to config.json")
+    return {"status": "saved"}
+
+
 # --- Antigravity OAuth Login ---
 
 # Store PKCE verifiers temporarily during OAuth flow
