@@ -2473,6 +2473,9 @@ async def dashboard():
     or_status = "Configured (saved)" if openrouter_api_key else "Not set"
     or_color = "#4ade80" if openrouter_api_key else "#64748b"
 
+    ollama_status = "Cloud (key configured)" if ollama_api_key else "Local (localhost:11434)"
+    ollama_color = "#4ade80" if ollama_api_key else "#64748b"
+
     codex_status = "Ready" if codex_auth.is_ready else ("Not authenticated" if CODEX_PATH else "Not installed")
     codex_color = "#4ade80" if codex_auth.is_ready else ("#facc15" if CODEX_PATH else "#64748b")
 
@@ -2642,6 +2645,34 @@ async def dashboard():
         <tbody>{antigravity_rows}</tbody>
       </table>
     </div>
+
+    <!-- Ollama Provider -->
+    <div class="provider-card" style="border-color:{ollama_color}40">
+      <div class="provider-header">
+        <h3 style="margin:0;font-size:1rem;color:#f1f5f9">🦙 Ollama</h3>
+        <span class="provider-status" style="background:{ollama_color}20;color:{ollama_color}">{ollama_status}</span>
+      </div>
+      <div style="margin-bottom:8px"><span class="label">Prefix:</span> <span class="value">ollama:model-name</span></div>
+      <div style="color:#64748b;font-size:0.8rem">
+        Pull models with <code style="color:#67e8f9">ollama pull model-name</code><br>
+        Set API key below for Ollama Cloud.
+      </div>
+    </div>
+  </div>
+
+  <!-- Ollama Cloud Key -->
+  <div class="card">
+    <h3 style="margin:0 0 8px; font-size:1rem; color:#f1f5f9">🦙 Ollama Cloud Key</h3>
+    <div style="display:flex; gap:8px; align-items:center">
+      <input type="password" id="ollamaKey" placeholder="API key"
+             style="flex:1; background:#0f172a; color:#e2e8f0; border:1px solid #334155;
+                    border-radius:6px; padding:8px 12px; font-family:monospace; font-size:0.85rem">
+      <button onclick="saveOllamaKey()" style="margin-top:0">Save</button>
+      <span id="ollamaStatus" style="color:{ollama_color}; font-size:0.85rem; font-weight:600">{ollama_status}</span>
+    </div>
+    <div style="color:#64748b; font-size:0.8rem; margin-top:8px">
+      Leave empty to use local Ollama at <code style="color:#67e8f9">localhost:11434</code>
+    </div>
   </div>
 
   <!-- OpenRouter -->
@@ -2692,6 +2723,11 @@ async def dashboard():
           <option value="antigravity-claude-sonnet-4-6">antigravity-claude-sonnet-4-6</option>
           <option value="antigravity-claude-opus-4-6-thinking">antigravity-claude-opus-4-6-thinking</option>
         </optgroup>
+        <optgroup label="Ollama Models">
+          <option value="ollama:llama3.2">ollama:llama3.2</option>
+          <option value="ollama:mistral">ollama:mistral</option>
+          <option value="ollama:qwen3:8b">ollama:qwen3:8b</option>
+        </optgroup>
       </select>
     </div>
     <textarea id="sysPrompt" rows="2" placeholder="System prompt">You are Lydia, a Nord housecarl sworn to protect the Dragonborn. Stay in character. One sentence only.</textarea>
@@ -2713,6 +2749,23 @@ async function saveOrKey() {{
     status.textContent = key ? 'Saved' : 'Not set';
     status.style.color = key ? '#4ade80' : '#64748b';
     document.getElementById('orKey').value = '';
+  }} catch(e) {{
+    status.textContent = 'Error';
+    status.style.color = '#f87171';
+  }}
+}}
+
+async function saveOllamaKey() {{
+  const key = document.getElementById('ollamaKey').value.trim();
+  const status = document.getElementById('ollamaStatus');
+  try {{
+    await fetch('/config/ollama-key', {{
+      method: 'POST', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{key: key}})
+    }});
+    status.textContent = key ? 'Cloud (key configured)' : 'Local (localhost:11434)';
+    status.style.color = key ? '#4ade80' : '#64748b';
+    document.getElementById('ollamaKey').value = '';
   }} catch(e) {{
     status.textContent = 'Error';
     status.style.color = '#f87171';
