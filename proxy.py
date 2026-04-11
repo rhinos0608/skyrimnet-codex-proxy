@@ -117,7 +117,17 @@ from proxy_internal.model_detect import (
 # --- Phase 5 facade imports: FastAPI schemas + routers ---
 # (populated by Phase 5 extraction)
 # --- Phase 6 facade imports: interceptors + tailscale ---
-# (populated by Phase 6 extraction)
+from proxy_internal.interceptors import (
+    interceptor_handler,
+    _kill_stale_port,
+    start_interceptor,
+    recapture_claude_auth,
+    _claude_auth_refresh_loop,
+    codex_interceptor_handler,
+    start_codex_interceptor,
+    load_opencode_key,
+)
+from proxy_internal.tailscale import _setup_tailscale_serve
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
@@ -1846,179 +1856,11 @@ async def _with_timeout_routing(gen, system_prompt, messages, oai_messages, mode
 
 
 # --- MITM Interceptor (startup only) ---
-
-async def interceptor_handler(request):
-    body = await request.read()
-    headers = dict(request.headers)
-    headers.pop("Host", None)
-    headers.pop("host", None)
-
-    try:
-        parsed = json.loads(body)
-    except Exception:
-        parsed = {}
-
-    model = parsed.get("model", "")
-    real_url = f"https://api.anthropic.com{request.path_qs}"
-
-    # Skip non-messages requests (e.g. HEAD / health checks from Claude CLI)
-    if "/v1/messages" not in request.path:
-        real_url = f"https://api.anthropic.com{request.path_qs}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.request(request.method, real_url, data=body, headers=headers) as resp:
-                    resp_body = await resp.read()
-                    return web.Response(body=resp_body, status=resp.status,
-                        headers={"Content-Type": resp.headers.get("Content-Type", "application/json")})
-        except Exception:
-            return web.Response(status=200)
-
-    # Skip haiku warmup and token counting
-    if "haiku" in model or "count_tokens" in request.path:
-        # Retry on transient network failures
-        max_retries = 3
-        last_error = None
-        for attempt in range(max_retries):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(real_url, data=body, headers=headers) as resp:
-                        resp_body = await resp.read()
-                        return web.Response(body=resp_body, status=resp.status,
-                            headers={"Content-Type": resp.headers.get("Content-Type", "application/json")})
-            except (aiohttp.ClientError, OSError) as e:
-                last_error = e
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-        # All retries failed - return error response
-        logger.error(f"Interceptor request failed after {max_retries} attempts: {last_error}")
-        return web.Response(status=503, text=f"Network error: {last_error}")
-
-    # Capture auth headers and body template
-    if not auth.is_ready:
-        global _cached_billing_block, _cached_auth_blocks
-        auth.headers = dict(headers)
-        # Strip tool definitions, system prompts, and other control-plane baggage
-        # from the cached template. The warm-up request itself is still forwarded
-        # unchanged so auth capture behaves exactly like the CLI invocation.
-        sanitized = _sanitize_claude_template(parsed)
-        auth.body_template = sanitized
-        # Cache the two fields reused on every inference call so _build_api_body
-        # can skip copy.deepcopy(auth.body_template) entirely.
-        _cached_billing_block = parsed["system"][0] if parsed.get("system") else None
-        first_msg = parsed["messages"][0] if parsed.get("messages") else {}
-        _cached_auth_blocks = [
-            b for b in (first_msg.get("content") or [])
-            if isinstance(b, dict) and b.get("type") == "text"
-            and "<system-reminder>" in b.get("text", "")
-        ]
-        template_size = len(json.dumps(sanitized))
-        logger.info(f"Captured {len(auth.headers)} headers + template ({template_size:,} bytes, tools/system stripped)")
-
-    # Forward to real API
-    forward_body = body
-    if not auth.is_ready:
-        forward_body = json.dumps(sanitized).encode("utf-8")
-    async with aiohttp.ClientSession() as session:
-        async with session.post(real_url, data=forward_body, headers=headers) as resp:
-            resp_body = await resp.read()
-            return web.Response(body=resp_body, status=resp.status,
-                headers={"Content-Type": resp.headers.get("Content-Type", "text/event-stream")})
-
-
-def _kill_stale_port(port: int) -> bool:
-    """Try to kill a stale process occupying a port. Returns True if a process was killed."""
-    import subprocess as _sp
-    try:
-        result = _sp.run(
-            ["lsof", "-ti", f"tcp:{port}"], capture_output=True, text=True, timeout=5
-        )
-        pids = result.stdout.strip().split()
-        if not pids:
-            return False
-        my_pid = str(os.getpid())
-        for pid in pids:
-            if pid and pid != my_pid:
-                logger.warning(f"Killing stale process {pid} on port {port}")
-                os.kill(int(pid), 9)
-        # Give OS a moment to release the socket
-        import time
-        time.sleep(0.3)
-        return True
-    except Exception as e:
-        logger.debug(f"Could not kill stale process on port {port}: {e}")
-        return False
-
-
-async def start_interceptor(port: int = INTERCEPTOR_PORT):
-    """Start MITM interceptor and capture auth from a clean temp dir.
-
-    Args:
-        port: Port to bind the interceptor to. Defaults to INTERCEPTOR_PORT (9999).
-              MCP mode uses MCP_INTERCEPTOR_PORT (9997) to avoid conflicts.
-    """
-    global _interceptor_port
-    _interceptor_port = port
-
-    iapp = web.Application()
-    iapp.router.add_route("*", "/{path_info:.*}", interceptor_handler)
-
-    runner = web.AppRunner(iapp)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", port)
-    try:
-        await site.start()
-    except OSError as e:
-        if e.errno == 48:  # Address already in use
-            logger.warning(f"Port {port} in use, killing stale process...")
-            _kill_stale_port(port)
-            # Rebuild runner — the old one's socket is in a bad state
-            await runner.cleanup()
-            runner = web.AppRunner(iapp)
-            await runner.setup()
-            site = web.TCPSite(runner, "127.0.0.1", port)
-            await site.start()
-        else:
-            raise
-    logger.info(f"Interceptor on port {port}")
-
-    max_retries = 3
-    for attempt in range(max_retries):
-        # Use clean temp dir to minimize system-reminder bloat (no CLAUDE.md, no skills)
-        # ignore_cleanup_errors=True prevents Windows errors when subprocess still holds dir handle
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
-            env = os.environ.copy()
-            env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
-
-            logger.info(f"Warming up: capturing auth from claude --print... (attempt {attempt + 1}/{max_retries})")
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    CLAUDE_PATH, "--print",
-                    "--output-format", "text",
-                    "--model", DEFAULT_MODEL,
-                    "--no-session-persistence",
-                    "--system-prompt", "Say ok",
-                    "ok",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                    cwd=tmpdir,
-                )
-                await asyncio.wait_for(proc.communicate(), timeout=90)
-                if auth.is_ready:
-                    break  # Success, exit retry loop
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning(f"Warmup attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
-
-    if auth.is_ready:
-        # Create persistent session for all future API calls
-        auth.session = create_session()
-        logger.info("Auth captured — direct API mode active (persistent session)")
-    else:
-        logger.error("Failed to capture auth headers after %d attempts!", max_retries)
-
-    return runner
+# interceptor_handler, _kill_stale_port, start_interceptor,
+# recapture_claude_auth, _claude_auth_refresh_loop, codex_interceptor_handler,
+# and start_codex_interceptor have been extracted to
+# proxy_internal/interceptors.py (Phase 6). They are re-exported via the
+# facade imports at the top of this file.
 
 
 # --- Claude Auth Auto-Refresh ---
@@ -2027,194 +1869,9 @@ _claude_refresh_lock = asyncio.Lock()
 _claude_refresh_task: Optional[asyncio.Task] = None
 
 
-async def recapture_claude_auth() -> bool:
-    """Re-run claude --print through the existing interceptor to refresh auth.
-    Returns True if auth was successfully recaptured."""
-    if not CLAUDE_PATH:
-        return False
-
-    async with _claude_refresh_lock:
-        # Another coroutine may have refreshed while we waited for the lock
-        if auth.is_ready:
-            return True
-
-        logger.info("Recapturing Claude auth...")
-        for attempt in range(3):
-            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
-                env = os.environ.copy()
-                env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{_interceptor_port}"
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        CLAUDE_PATH, "--print",
-                        "--output-format", "text",
-                        "--model", DEFAULT_MODEL,
-                        "--no-session-persistence",
-                        "--system-prompt", "Say ok",
-                        "ok",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        env=env,
-                        cwd=tmpdir,
-                    )
-                    await asyncio.wait_for(proc.communicate(), timeout=90)
-                    if auth.is_ready:
-                        # Recreate the persistent session with fresh auth
-                        if auth.session:
-                            await auth.session.close()
-                        auth.session = create_session()
-                        logger.info("Claude auth recaptured successfully")
-                        return True
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"Auth recapture attempt {attempt + 1} failed: {e}")
-                    if attempt < 2:
-                        await asyncio.sleep(2 ** attempt)
-
-        logger.error("Claude auth recapture failed after 3 attempts")
-        return False
-
-
-async def _claude_auth_refresh_loop():
-    """Background task that proactively recaptures Claude auth before it expires.
-    Claude CLI tokens typically last ~1 hour; we recapture every 45 minutes."""
-    REFRESH_INTERVAL = 45 * 60  # 45 minutes
-    while True:
-        await asyncio.sleep(REFRESH_INTERVAL)
-        if not CLAUDE_PATH:
-            break
-        logger.info("Proactive Claude auth refresh triggered")
-        # Clear auth to force recapture through the interceptor
-        auth.headers = None
-        auth.body_template = None
-        await recapture_claude_auth()
-
-
 # --- Codex MITM Interceptor (startup only) ---
 
 CODEX_INTERCEPTOR_PORT = 9998
-
-
-async def codex_interceptor_handler(request):
-    """Handle Codex CLI traffic - captures OAuth tokens from auth flow."""
-    body = await request.read()
-    headers = dict(request.headers)
-    headers.pop("Host", None)
-    headers.pop("host", None)
-
-    try:
-        parsed = json.loads(body)
-    except Exception:
-        parsed = {}
-
-    real_url = f"https://api.openai.com{request.path_qs}"
-
-    # Check if this is an auth token request (to our interceptor)
-    # Codex CLI makes a request to localhost:1455 to receive the OAuth callback
-    if request.path == "/auth/callback" or request.path == "/oauth/callback":
-        # This is the OAuth callback - capture the tokens
-        auth_code = request.query.get("code")
-        if auth_code and not codex_auth.access_token:
-            # Exchange code for tokens
-            try:
-                async with aiohttp.ClientSession() as session:
-                    token_payload = {
-                        "grant_type": "authorization_code",
-                        "code": auth_code,
-                        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
-                        "redirect_uri": f"http://127.0.0.1:{CODEX_INTERCEPTOR_PORT}/auth/callback",
-                    }
-                    async with session.post(
-                        "https://auth.openai.com/oauth/token",
-                        json=token_payload,
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            codex_auth.access_token = data.get("access_token")
-                            codex_auth.refresh_token = data.get("refresh_token")
-                            expires_in = data.get("expires_in", 3600)
-                            codex_auth.expires_at = datetime.now() + timedelta(seconds=expires_in)
-                            codex_auth.account_id = data.get("account_id")
-                            logger.info(f"Captured Codex OAuth tokens (expires in {expires_in}s)")
-                            return web.Response(
-                                status=200,
-                                text="<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>",
-                                content_type="text/html",
-                            )
-            except Exception as e:
-                logger.error(f"Failed to exchange OAuth code: {e}")
-
-    # Capture authorization header if present
-    auth_header = headers.get("Authorization", "")
-    if auth_header.startswith("Bearer ") and not codex_auth.access_token:
-        token = auth_header[7:]
-        codex_auth.access_token = token
-        # Assume 1 hour expiry if we don't know
-        codex_auth.expires_at = datetime.now() + timedelta(hours=1)
-        logger.info("Captured Codex Bearer token from request header")
-
-    # Forward to real API
-    async with aiohttp.ClientSession() as session:
-        async with session.request(
-            method=request.method,
-            url=real_url,
-            data=body,
-            headers=headers,
-        ) as resp:
-            resp_body = await resp.read()
-            return web.Response(
-                body=resp_body,
-                status=resp.status,
-                headers={
-                    "Content-Type": resp.headers.get("Content-Type", "application/json"),
-                },
-            )
-
-
-async def start_codex_interceptor():
-    """Load Codex auth from cached auth.json file (from 'codex login')."""
-    if not CODEX_PATH:
-        logger.warning("Codex CLI not found, skipping Codex auth capture")
-        return None
-
-    # Try to read cached auth from ~/.codex/auth.json
-    auth_file = os.path.expanduser("~/.codex/auth.json")
-    if os.path.exists(auth_file):
-        try:
-            with open(auth_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            tokens = data.get("tokens", {})
-            if tokens.get("access_token"):
-                codex_auth.access_token = tokens["access_token"]
-                codex_auth.refresh_token = tokens.get("refresh_token")
-                codex_auth.account_id = tokens.get("account_id")
-
-                # Parse expiry from last_refresh + assume 24hr validity
-                last_refresh = data.get("last_refresh")
-                if last_refresh:
-                    try:
-                        # Parse ISO format timestamp
-                        last_refresh_dt = datetime.fromisoformat(last_refresh.replace("Z", "+00:00"))
-                        # Make it naive for comparison
-                        last_refresh_dt = last_refresh_dt.replace(tzinfo=None)
-                        # Assume 24 hour token validity
-                        codex_auth.expires_at = last_refresh_dt + timedelta(hours=24)
-                    except Exception:
-                        codex_auth.expires_at = datetime.now() + timedelta(hours=23)
-
-                logger.info(f"Loaded Codex auth from {auth_file}")
-                if codex_auth.is_expired():
-                    logger.warning("Codex token may be expired, will attempt refresh")
-        except Exception as e:
-            logger.error(f"Failed to read Codex auth file: {e}")
-
-    if codex_auth.is_ready:
-        codex_auth.session = create_session()
-        logger.info("Codex auth loaded - direct API mode active")
-    else:
-        logger.warning("Failed to load Codex auth")
-        logger.info("Note: Run 'codex login' first, then restart proxy")
-
-    return None  # No interceptor needed - we read from file
 
 
 async def _fetch_gemini_project_id() -> None:
@@ -4019,54 +3676,8 @@ def _save_antigravity_auth():
 
 
 # --- OpenCode Auth Loading ---
-
-def load_opencode_key():
-    """Load OpenCode API keys from ~/.local/share/opencode/auth.json if not already configured.
-
-    Zen and Go plans share the same API key, so a single key is sufficient for both.
-    If only one key is available (from config.json or auth.json), it is used for both plans.
-    """
-    global opencode_api_key, opencode_go_api_key
-
-    if not os.path.exists(OPENCODE_AUTH_FILE):
-        if not opencode_api_key and not opencode_go_api_key:
-            logger.info("No OpenCode auth file found -- set up OpenCode first or add key via /config/opencode-key")
-        # Even without auth file, share whichever key we already have from config.json
-        if opencode_api_key and not opencode_go_api_key:
-            opencode_go_api_key = opencode_api_key
-            logger.info("OpenCode Go using shared Zen API key from config")
-        elif opencode_go_api_key and not opencode_api_key:
-            opencode_api_key = opencode_go_api_key
-            logger.info("OpenCode Zen using shared Go API key from config")
-        return
-
-    try:
-        with open(OPENCODE_AUTH_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # Load Zen key
-        if not opencode_api_key:
-            oc_entry = data.get("opencode", {})
-            if oc_entry.get("type") == "api" and oc_entry.get("key"):
-                opencode_api_key = oc_entry["key"]
-                logger.info("OpenCode Zen API key loaded from auth file")
-
-        # Load Go key
-        if not opencode_go_api_key:
-            go_entry = data.get("opencode-go", {})
-            if go_entry.get("type") == "api" and go_entry.get("key"):
-                opencode_go_api_key = go_entry["key"]
-                logger.info("OpenCode Go API key loaded from auth file")
-
-        # Zen and Go share the same key — fill in whichever is missing
-        if opencode_api_key and not opencode_go_api_key:
-            opencode_go_api_key = opencode_api_key
-            logger.info("OpenCode Go using shared Zen API key")
-        elif opencode_go_api_key and not opencode_api_key:
-            opencode_api_key = opencode_go_api_key
-            logger.info("OpenCode Zen using shared Go API key")
-    except Exception as e:
-        logger.error(f"Failed to load OpenCode auth: {e}")
+# load_opencode_key has been extracted to proxy_internal/interceptors.py
+# (Phase 6) and re-exported via the facade imports at the top of this file.
 
 
 # --- Qwen Code Auth Loading ---
@@ -8803,54 +8414,8 @@ async function removeAccount(email) {{
 </body></html>"""
 
 
-def _setup_tailscale_serve(ports: list[int]):
-    """Configure Tailscale HTTPS reverse proxy for the given local ports.
-
-    Uses `tailscale serve --bg` to map each port to HTTPS on the machine's
-    Tailscale FQDN.  Requires Tailscale to be running and `tailscale serve`
-    to be available (MagicDNS + HTTPS enabled on the tailnet).
-    """
-    import shutil
-    import subprocess
-
-    if not shutil.which("tailscale"):
-        logger.warning("tailscale CLI not found — skipping HTTPS setup")
-        return
-
-    # Get this machine's Tailscale FQDN
-    try:
-        result = subprocess.run(
-            ["tailscale", "status", "--json"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0:
-            logger.warning("tailscale status failed — is Tailscale running?")
-            return
-        import json as _json
-        ts_status = _json.loads(result.stdout)
-        fqdn = ts_status.get("Self", {}).get("DNSName", "").rstrip(".")
-        if not fqdn:
-            logger.warning("Could not determine Tailscale FQDN")
-            return
-    except Exception as e:
-        logger.warning(f"Failed to query Tailscale status: {e}")
-        return
-
-    for port in ports:
-        try:
-            result = subprocess.run(
-                ["tailscale", "serve", "--bg", "--https", str(port),
-                 f"http://127.0.0.1:{port}"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                logger.info(f"Tailscale HTTPS: https://{fqdn}:{port} -> http://127.0.0.1:{port}")
-            else:
-                logger.warning(f"tailscale serve failed for port {port}: {result.stderr.strip()}")
-        except Exception as e:
-            logger.warning(f"Failed to set up Tailscale serve for port {port}: {e}")
-
-    logger.info(f"Tailscale FQDN: {fqdn}")
+# _setup_tailscale_serve has been extracted to proxy_internal/tailscale.py
+# (Phase 6) and re-exported via the facade imports at the top of this file.
 
 
 if __name__ == "__main__":
