@@ -634,15 +634,27 @@ def _load_config() -> dict:
 
 
 def _save_config(data: dict) -> None:
-    """Persist config dict to disk, encrypting secret fields."""
+    """Persist config dict to disk, encrypting secret fields.
+
+    Writes atomically via write-then-rename so a crash or a concurrent save
+    cannot leave ``config.json`` half-written — a torn write would corrupt
+    the Fernet ciphertexts and lock the user out of every stored API key.
+    """
     fernet = _get_fernet()
     out = dict(data)
     for field in _ENCRYPTED_CONFIG_FIELDS:
         val = out.get(field)
         if isinstance(val, str) and val and not val.startswith(_ENC_PREFIX):
             out[field] = _encrypt_value(fernet, val)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+    tmp_path = f"{CONFIG_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass  # fsync unsupported on some filesystems — best effort
+    os.replace(tmp_path, CONFIG_FILE)
 
 
 # --- Auth cache + persistent session ---
@@ -2861,7 +2873,12 @@ async def call_openrouter_direct(system_prompt: Optional[str], messages: list, m
                 logger.error(f"[{request_id}] OpenRouter {resp.status}: {error_body[:300]}")
                 raise HTTPException(status_code=resp.status, detail=error_body[:200])
             data = await resp.json()
-            text = data["choices"][0]["message"]["content"]
+            choices = data.get("choices") or []
+            if not choices:
+                raise HTTPException(status_code=502, detail="OpenRouter returned no choices")
+            text = (choices[0].get("message") or {}).get("content")
+            if text is None:
+                raise HTTPException(status_code=502, detail="OpenRouter returned no content")
             logger.info(f"[{request_id}] <- {len(text)} chars ({elapsed:.1f}s, OpenRouter)")
             return text
     finally:
@@ -4785,6 +4802,11 @@ async def _chat_completions_inner(req: ChatRequest):
     # cause 401/400 errors on providers that don't understand them.
     extra_params = {k: v for k, v in (req.model_extra or {}).items()
                     if v is not None and k in _CHAT_ALLOWED_EXTRA}
+    # Declared-on-ChatRequest sampling fields live outside model_extra, so
+    # merge them in explicitly — otherwise top-level `temperature` from the
+    # request body would be silently dropped.
+    if req.temperature is not None:
+        extra_params.setdefault("temperature", req.temperature)
 
     def _stream(gen):
         """Wrap a streaming generator with timeout routing if enabled."""
@@ -4881,6 +4903,484 @@ async def _chat_completions_inner(req: ChatRequest):
         },
         "system_fingerprint": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Messages API compatibility layer (/v1/messages)
+#
+# Translates the Anthropic Messages API shape into the existing OpenAI-format
+# pipeline and back.  Scope: text in / text out.  Tool definitions in the
+# request are flattened into the system prompt so the backend model is at
+# least aware they exist; tool_use / tool_result blocks in message history are
+# rendered into plain text so conversational context survives.  The backend
+# providers in this proxy do not emit structured tool_calls, so the assistant
+# cannot fire tools end-to-end — clients like Claude Code that require tool
+# execution should use this endpoint only for chat-style interactions.
+# ---------------------------------------------------------------------------
+
+# Anthropic stop_reason <- OpenAI finish_reason
+_ANTHROPIC_STOP_REASON_MAP = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "content_filter": "stop_sequence",
+    "tool_calls": "tool_use",
+    "function_call": "tool_use",
+}
+
+
+def _anthropic_flatten_system(system_field) -> Optional[str]:
+    """Anthropic 'system' may be a string or a list of content blocks."""
+    if system_field is None:
+        return None
+    if isinstance(system_field, str):
+        return system_field or None
+    if isinstance(system_field, list):
+        parts = []
+        for block in system_field:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                if text:
+                    parts.append(text)
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n\n".join(parts) or None
+    return None
+
+
+def _anthropic_flatten_content(content) -> str:
+    """Render an Anthropic message content field as plain text.
+
+    Content can be a string or a list of content blocks.  Tool_use / tool_result
+    blocks are rendered in a readable form so conversation context survives the
+    trip through a text-only pipeline.  Image blocks collapse to a placeholder.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            if block:
+                parts.append(str(block))
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text", "")
+            if text:
+                parts.append(text)
+        elif btype == "tool_use":
+            name = block.get("name", "")
+            tool_input = block.get("input", {})
+            try:
+                rendered_input = json.dumps(tool_input, ensure_ascii=False)
+            except (TypeError, ValueError):
+                rendered_input = str(tool_input)
+            parts.append(f"[tool_use name={name} input={rendered_input}]")
+        elif btype == "tool_result":
+            tool_use_id = block.get("tool_use_id", "")
+            inner = block.get("content", "")
+            if isinstance(inner, list):
+                inner_text = _anthropic_flatten_content(inner)
+            else:
+                inner_text = str(inner) if inner is not None else ""
+            is_error = " error" if block.get("is_error") else ""
+            parts.append(f"[tool_result id={tool_use_id}{is_error}]\n{inner_text}")
+        elif btype == "image":
+            parts.append("[image]")
+        elif btype == "thinking":
+            # Extended thinking blocks are internal — drop silently
+            continue
+        elif btype == "document":
+            parts.append("[document]")
+    return "\n\n".join(p for p in parts if p)
+
+
+def _anthropic_tools_to_system_hint(tools) -> Optional[str]:
+    """Render Anthropic tool definitions as a system-prompt hint.
+
+    The backend text-only pipeline cannot natively dispatch tools, but including
+    the tool catalogue in the system prompt means the model at least knows what
+    capabilities exist in the conversation.
+    """
+    if not tools or not isinstance(tools, list):
+        return None
+    summaries = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name", "")
+        if not name:
+            continue
+        desc = (tool.get("description") or "").strip()
+        if desc:
+            summaries.append(f"- {name}: {desc}")
+        else:
+            summaries.append(f"- {name}")
+    if not summaries:
+        return None
+    return "Available tools (text-only description):\n" + "\n".join(summaries)
+
+
+def _anthropic_request_to_chat_request(body: dict) -> "ChatRequest":
+    """Translate an Anthropic /v1/messages payload to this proxy's ChatRequest."""
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    model = body.get("model") or DEFAULT_MODEL
+    raw_messages = body.get("messages") or []
+    if not isinstance(raw_messages, list):
+        raise HTTPException(status_code=400, detail="'messages' must be an array")
+
+    system_prompt = _anthropic_flatten_system(body.get("system"))
+    tool_hint = _anthropic_tools_to_system_hint(body.get("tools"))
+    if tool_hint:
+        system_prompt = f"{system_prompt}\n\n{tool_hint}" if system_prompt else tool_hint
+
+    flat_messages: list[dict] = []
+    if system_prompt:
+        flat_messages.append({"role": "system", "content": system_prompt})
+
+    for msg in raw_messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = _anthropic_flatten_content(msg.get("content"))
+        if not text:
+            continue
+        flat_messages.append({"role": role, "content": text})
+
+    if not any(m["role"] == "user" for m in flat_messages):
+        raise HTTPException(status_code=400, detail="At least one user message is required")
+
+    # Build a ChatRequest.  Only forward sampling params the existing pipeline
+    # already whitelists via _CHAT_ALLOWED_EXTRA.
+    chat_payload: dict = {
+        "model": model,
+        "messages": flat_messages,
+        "max_tokens": body.get("max_tokens") or 4096,
+        "stream": bool(body.get("stream")),
+    }
+    if "temperature" in body and body["temperature"] is not None:
+        chat_payload["temperature"] = body["temperature"]
+    if "top_p" in body and body["top_p"] is not None:
+        chat_payload["top_p"] = body["top_p"]
+    if "top_k" in body and body["top_k"] is not None:
+        chat_payload["top_k"] = body["top_k"]
+    stop_sequences = body.get("stop_sequences")
+    if stop_sequences:
+        chat_payload["stop"] = stop_sequences
+
+    return ChatRequest(**chat_payload)
+
+
+def _approx_tokens(text: str) -> int:
+    """Cheap token estimate used for usage reporting (chars / 4)."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def _openai_completion_to_anthropic_message(oai_resp: dict, request_model: str) -> dict:
+    """Translate a non-streaming OpenAI chat.completion dict to an Anthropic message."""
+    choice = (oai_resp.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    text = message.get("content") or ""
+    finish_reason = choice.get("finish_reason") or "stop"
+    stop_reason = _ANTHROPIC_STOP_REASON_MAP.get(finish_reason, "end_turn")
+
+    usage = oai_resp.get("usage") or {}
+    input_tokens = usage.get("prompt_tokens")
+    output_tokens = usage.get("completion_tokens")
+    if input_tokens is None:
+        input_tokens = 0
+    if output_tokens is None:
+        output_tokens = _approx_tokens(text)
+
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": request_model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": int(input_tokens),
+            "output_tokens": int(output_tokens),
+        },
+    }
+
+
+def _format_anthropic_sse(event: str, data: dict) -> str:
+    """Format an Anthropic SSE event (named event + JSON data line).
+
+    Uses the project-wide ``json_dumps`` which is orjson-backed when
+    available, shaving meaningful latency off high-frequency text_delta
+    events in the streaming hot path.
+    """
+    return f"event: {event}\ndata: {json_dumps(data).decode('utf-8')}\n\n"
+
+
+async def _anthropic_stream_from_openai(
+    openai_iter,
+    request_model: str,
+    prompt_tokens_hint: int,
+):
+    """Wrap an OpenAI SSE async iterator and emit Anthropic Messages SSE events.
+
+    The upstream generator yields OpenAI chat.completion.chunk SSE lines ending
+    with 'data: [DONE]\\n\\n'.  We parse text deltas out of them and re-emit as
+    Anthropic message_start / content_block_* / message_delta / message_stop.
+    """
+    message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    output_chars = 0
+    finish_reason: Optional[str] = None
+    content_block_open = False
+
+    # Opening events.
+    message_start_payload = {
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": request_model,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": max(0, int(prompt_tokens_hint)),
+                "output_tokens": 0,
+            },
+        },
+    }
+    yield _format_anthropic_sse("message_start", message_start_payload)
+    yield _format_anthropic_sse(
+        "content_block_start",
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    )
+    content_block_open = True
+
+    buffer = ""
+    upstream_error: Optional[str] = None
+    try:
+        async for raw_chunk in openai_iter:
+            # The upstream generator yields strings (SSE-formatted).  Normalise.
+            if isinstance(raw_chunk, bytes):
+                raw_chunk = raw_chunk.decode("utf-8", errors="replace")
+            if not isinstance(raw_chunk, str):
+                continue
+            buffer += raw_chunk
+            # Each SSE event is terminated by a blank line.
+            while "\n\n" in buffer:
+                event_block, buffer = buffer.split("\n\n", 1)
+                for line in event_block.split("\n"):
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload_str = line[5:].strip()
+                    if not payload_str or payload_str == "[DONE]":
+                        continue
+                    try:
+                        payload = json.loads(payload_str)
+                    except json.JSONDecodeError:
+                        continue
+                    # A few providers surface pre-flight failures as raw
+                    # {"error": ...} chunks with no choices array.  Fold
+                    # them into a text_delta so the client sees the reason
+                    # rather than a silently-empty stream.
+                    if isinstance(payload.get("error"), (str, dict)) and not payload.get("choices"):
+                        err_payload = payload["error"]
+                        err_text = err_payload if isinstance(err_payload, str) else \
+                            err_payload.get("message") or json.dumps(err_payload)
+                        err_text = f"[upstream error] {err_text}"
+                        output_chars += len(err_text)
+                        yield _format_anthropic_sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": err_text},
+                            },
+                        )
+                        continue
+                    choices = payload.get("choices") or []
+                    if not choices:
+                        continue
+                    choice0 = choices[0]
+                    delta = choice0.get("delta") or {}
+                    delta_text = delta.get("content")
+                    if delta_text:
+                        output_chars += len(delta_text)
+                        yield _format_anthropic_sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": delta_text},
+                            },
+                        )
+                    fr = choice0.get("finish_reason")
+                    if fr and not finish_reason:
+                        finish_reason = fr
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+            aiohttp.ClientError, asyncio.CancelledError):
+        # Client-side disconnects and upstream aborts — re-raise after the
+        # finally below flushes closing events so the client (if still
+        # connected) can observe a clean message_stop.
+        logger.debug("Upstream/downstream disconnect in /v1/messages stream")
+        upstream_error = "client_disconnect"
+    except Exception as exc:  # noqa: BLE001 — defensive: never leave a stream half-open
+        logger.exception("Unexpected error in _anthropic_stream_from_openai")
+        upstream_error = str(exc) or type(exc).__name__
+        # Surface the failure in the message body so the client gets a
+        # reason rather than a silently truncated response.
+        try:
+            yield _format_anthropic_sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": f"[stream error] {upstream_error}"},
+                },
+            )
+        except Exception:
+            pass
+    finally:
+        if content_block_open:
+            try:
+                yield _format_anthropic_sse(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": 0},
+                )
+            except Exception:
+                pass
+        if upstream_error and not finish_reason:
+            finish_reason = "stop"
+        stop_reason = _ANTHROPIC_STOP_REASON_MAP.get(finish_reason or "stop", "end_turn")
+        try:
+            yield _format_anthropic_sse(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": {"output_tokens": max(1, output_chars // 4)},
+                },
+            )
+            yield _format_anthropic_sse("message_stop", {"type": "message_stop"})
+        except Exception:
+            pass
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    """Anthropic Messages API compatibility endpoint.
+
+    Translates the request to the existing OpenAI chat-completions pipeline and
+    translates the response back.  Supports streaming and non-streaming.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    chat_req = _anthropic_request_to_chat_request(body)
+    request_model = body.get("model") or DEFAULT_MODEL
+    is_stream = bool(body.get("stream"))
+
+    # Rough prompt-token estimate for the message_start usage field.
+    try:
+        prompt_chars = sum(len(m.content) for m in chat_req.messages if isinstance(m.content, str))
+    except Exception:
+        prompt_chars = 0
+    prompt_tokens_hint = prompt_chars // 4
+
+    try:
+        inner_result = await _chat_completions_inner(chat_req)
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+            aiohttp.ClientOSError, aiohttp.ServerDisconnectedError):
+        logger.debug("Client disconnected mid-/v1/messages — suppressing traceback")
+        raise HTTPException(status_code=499, detail="Client disconnected")
+
+    if is_stream:
+        if not isinstance(inner_result, StreamingResponse):
+            # Provider did not honour stream=True; wrap the dict result into a
+            # single-shot Anthropic stream so the client still gets valid events.
+            async def _oneshot():
+                text = ""
+                if isinstance(inner_result, dict):
+                    choices = inner_result.get("choices") or []
+                    if choices:
+                        text = (choices[0].get("message") or {}).get("content") or ""
+                # Re-emit as a minimal OpenAI SSE for our wrapper to parse.
+                chunk = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request_model,
+                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+                done_chunk = {
+                    "id": chunk["id"], "object": "chat.completion.chunk",
+                    "created": chunk["created"], "model": request_model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(done_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+            source_iter = _oneshot()
+        else:
+            source_iter = inner_result.body_iterator
+
+        return StreamingResponse(
+            _anthropic_stream_from_openai(source_iter, request_model, prompt_tokens_hint),
+            media_type="text/event-stream",
+            headers=_STREAMING_HEADERS,
+        )
+
+    if not isinstance(inner_result, dict):
+        raise HTTPException(status_code=500, detail="Unexpected upstream response type")
+    return _openai_completion_to_anthropic_message(inner_result, request_model)
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(request: Request):
+    """Stub for Anthropic's token-count endpoint.
+
+    Claude Code calls this during startup to size the prompt budget.  We return
+    a coarse chars/4 estimate so the client can proceed — exact token counts
+    would require per-model tokenisers this proxy does not ship.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    total_chars = 0
+    system_text = _anthropic_flatten_system(body.get("system")) or ""
+    total_chars += len(system_text)
+    for msg in body.get("messages") or []:
+        if isinstance(msg, dict):
+            total_chars += len(_anthropic_flatten_content(msg.get("content")))
+    # Tool definitions add prompt weight too.
+    tools = body.get("tools") or []
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict):
+                total_chars += len(tool.get("name", "")) + len(tool.get("description") or "")
+                schema = tool.get("input_schema")
+                if schema:
+                    try:
+                        total_chars += len(json.dumps(schema))
+                    except (TypeError, ValueError):
+                        pass
+    return {"input_tokens": max(1, total_chars // 4)}
 
 
 @app.post("/config/openrouter-key")

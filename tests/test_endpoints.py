@@ -406,6 +406,21 @@ class TestChatCompletionsEndpoint:
         assert resp.status_code == 200
         mock_call.assert_called_once()
 
+    def test_top_level_temperature_is_forwarded(self, test_client, proxy_module):
+        """Top-level `temperature` field must reach the provider, not be silently dropped."""
+        with patch.object(proxy_module, "call_ollama_direct",
+                          new_callable=AsyncMock, return_value="ok") as mock_call, \
+             patch.object(proxy_module, "request_stats", MagicMock(record=MagicMock())):
+            resp = test_client.post("/v1/chat/completions", json={
+                "model": "ollama:llama3.2",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "temperature": 0.42,
+                "stream": False,
+            })
+        assert resp.status_code == 200
+        kwargs = mock_call.call_args.kwargs
+        assert kwargs.get("temperature") == 0.42
+
     def test_routes_to_claude_provider(self, test_client, proxy_module):
         """Default model routes to Claude (call_api_direct)."""
         mock_auth = MagicMock(is_ready=True, session=MagicMock(), headers={},
