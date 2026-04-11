@@ -283,6 +283,35 @@ async def test_call_ollama_direct_cloud_endpoint_and_auth(proxy_module):
 
 
 @pytest.mark.asyncio
+async def test_call_ollama_direct_retries_reasoning_truncation_without_max_tokens(proxy_module):
+    """Reasoning-only truncation should retry once without max_tokens."""
+    first_resp = _make_mock_response(
+        200,
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"reasoning_content": "internal trace"},
+            }]
+        },
+    )
+    second_resp = _make_mock_response(200, {"choices": [{"message": {"content": "final answer"}}]})
+    session = MagicMock()
+    session.post = MagicMock(side_effect=[first_resp, second_resp])
+    session.close = AsyncMock()
+
+    with patch.object(proxy_module, "ollama_api_key", None), \
+         patch.object(proxy_module, "auth", MagicMock(session=None)), \
+         patch("aiohttp.ClientSession", return_value=session):
+        result = await proxy_module.call_ollama_direct(
+            None, [{"role": "user", "content": "hi"}], "ollama:llama3.2", 100
+        )
+
+    assert result == "final answer"
+    assert session.post.call_args_list[0].kwargs["json"]["max_tokens"] == 100
+    assert "max_tokens" not in session.post.call_args_list[1].kwargs["json"]
+
+
+@pytest.mark.asyncio
 async def test_call_ollama_direct_unreachable_raises_503(proxy_module):
     """ClientConnectorError → HTTPException 503."""
     import aiohttp
@@ -356,7 +385,15 @@ async def call_ollama_direct(system_prompt: Optional[str], messages: list, model
                 logger.error(f"[{request_id}] Ollama {resp.status}: {error_body[:300]}")
                 raise HTTPException(status_code=resp.status, detail=error_body[:200])
             data = await resp.json()
-            text = data["choices"][0]["message"]["content"]
+            text = _extract_oai_content(data["choices"][0]["message"])
+            if text is None and _is_reasoning_truncated(data):
+                retry_payload = dict(payload)
+                retry_payload.pop("max_tokens", None)
+                async with session.post(endpoint, json=retry_payload, headers=headers) as retry_resp:
+                    retry_data = await retry_resp.json()
+                    text = _extract_oai_content(retry_data["choices"][0]["message"])
+            if text is None:
+                raise HTTPException(status_code=502, detail="Ollama returned no content")
             logger.info(f"[{request_id}] <- {len(text)} chars ({elapsed:.1f}s, Ollama)")
             return text
     except aiohttp.ClientConnectorError:

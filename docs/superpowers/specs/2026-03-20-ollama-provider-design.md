@@ -80,6 +80,7 @@ Added immediately before `is_openrouter_model` in source order.
 - Build `oai_messages` same way as `call_openrouter_direct`
 - Payload: `{"model": api_model, "messages": oai_messages, "max_tokens": max_tokens, **extra_params}`
 - Session: `session = auth.session or create_session()`. `auth.session` may be `None` (Ollama-only deployment with no Claude auth) — this is normal and expected. In that case `create_session()` provides an owned session. Cleanup: `if not auth.session: await session.close()` in `finally`
+- Parse `choices[0].message.content` defensively. If `content` is empty while reasoning fields are present and `finish_reason == "length"`, retry once without `max_tokens`. If Ollama still returns no usable content, surface that as an upstream error instead of raising `KeyError`.
 - Transport and HTTP error handling (catch in this order):
   - `aiohttp.ClientConnectorError` (connection refused, local not running) → `HTTPException(503, "Ollama not running at localhost:11434")`
   - `asyncio.TimeoutError` → `HTTPException(504, "Ollama request timed out")`
@@ -159,6 +160,8 @@ No `ollama_session` global is added. Ollama uses the per-request `auth.session o
 | Timeout (`asyncio.TimeoutError`) | HTTP 504 | SSE error chunk + DONE |
 | Cloud auth fail (401/403) | HTTP 401 | SSE error chunk + DONE |
 | Rate limit (429) | HTTP 429 | SSE error chunk + DONE |
+| Reasoning truncated (`finish_reason="length"` with no content) | Retry once without `max_tokens` | N/A |
+| No usable content after parsing/retry | HTTP 502 | SSE error chunk + DONE |
 | Other non-200 | HTTP `resp.status` | SSE error chunk + DONE |
 
 ---
