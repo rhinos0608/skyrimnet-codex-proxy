@@ -226,6 +226,128 @@ async def test_antigravity_account_not_expired_skips_refresh(proxy_module):
 # benefits from the per-account lock (each account refreshes at most once).
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Fix 5: Qwen refresh_if_needed offloads reload_from_file to a thread
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_qwen_refresh_if_needed_runs_reload_in_executor(proxy_module):
+    """``reload_from_file`` is synchronous disk I/O; ``refresh_if_needed``
+    must schedule it via ``asyncio.to_thread`` so the event loop stays
+    responsive.  We verify the result propagates correctly and the event
+    loop yields at least once during the reload (a direct sync call would
+    not yield)."""
+    cache = proxy_module.QwenAuthCache()
+    _make_expired(cache)
+
+    loop = asyncio.get_running_loop()
+    call_threads: list[int] = []
+
+    def fake_reload():
+        import threading
+        call_threads.append(threading.get_ident())
+        # simulate small disk latency
+        import time as _time
+        _time.sleep(0.02)
+        cache.access_token = "qwen-token-from-thread"
+        _make_fresh(cache)
+        return True
+
+    cache.reload_from_file = fake_reload
+
+    main_thread_id = __import__("threading").get_ident()
+    result = await cache.refresh_if_needed()
+
+    assert result is True
+    assert cache.access_token == "qwen-token-from-thread"
+    # The sync reload should have executed on a worker thread, NOT on the
+    # main thread — proving we didn't block the loop.
+    assert len(call_threads) == 1
+    assert call_threads[0] != main_thread_id
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: AntigravityAuthCache.refresh_if_needed snapshots accounts list
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_antigravity_refresh_concurrent_add_remove_account(proxy_module):
+    """A concurrent ``add_account``/``remove_account`` call mid-refresh
+    must not raise or cause a silent skip.  The refresh should still
+    complete successfully for every account that was present at entry."""
+    cache = proxy_module.AntigravityAuthCache()
+
+    acct1 = proxy_module.AntigravityAccount()
+    acct1.refresh_token = "rt-1"
+    acct1.email = "a@example.com"
+    _make_expired(acct1)
+
+    acct2 = proxy_module.AntigravityAccount()
+    acct2.refresh_token = "rt-2"
+    acct2.email = "b@example.com"
+    _make_expired(acct2)
+
+    cache.accounts = [acct1, acct2]
+
+    refresh_events: list[str] = []
+
+    async def slow_refresh_a():
+        refresh_events.append("a-start")
+        await asyncio.sleep(0.05)  # window during which add/remove may fire
+        acct1.access_token = "tok-a"
+        _make_fresh(acct1)
+        refresh_events.append("a-done")
+        return True
+
+    async def slow_refresh_b():
+        refresh_events.append("b-start")
+        await asyncio.sleep(0.05)
+        acct2.access_token = "tok-b"
+        _make_fresh(acct2)
+        refresh_events.append("b-done")
+        return True
+
+    acct1._do_refresh = slow_refresh_a
+    acct2._do_refresh = slow_refresh_b
+
+    class _StubSession:
+        async def close(self):
+            pass
+
+    # Pre-populate sessions to avoid create_session() during refresh, and
+    # give them an async close() so remove_account can cleanly dispose.
+    acct1.session = _StubSession()
+    acct2.session = _StubSession()
+
+    async def mutate_accounts():
+        # Let refresh_if_needed start iterating and grab its snapshot.
+        await asyncio.sleep(0.01)
+        # Simulate a user adding a new account mid-refresh.
+        acct3 = proxy_module.AntigravityAccount()
+        acct3.refresh_token = "rt-3"
+        acct3.email = "c@example.com"
+        _make_fresh(acct3)
+        acct3.access_token = "tok-c-preexisting"
+        acct3.session = _StubSession()
+        cache.add_account(acct3)
+        # And removing one of the in-flight accounts.
+        cache.remove_account("b@example.com")
+
+    # Run both concurrently — snapshot means neither mutation disrupts
+    # the in-flight refresh.
+    result, _ = await asyncio.gather(
+        cache.refresh_if_needed(),
+        mutate_accounts(),
+    )
+
+    assert result is True
+    # Both snapshot accounts completed their refresh despite the mutation.
+    assert "a-done" in refresh_events
+    assert "b-done" in refresh_events
+    assert acct1.access_token == "tok-a"
+    assert acct2.access_token == "tok-b"
+
+
 @pytest.mark.asyncio
 async def test_antigravity_auth_cache_fanout_locks_per_account(proxy_module):
     cache = proxy_module.AntigravityAuthCache()

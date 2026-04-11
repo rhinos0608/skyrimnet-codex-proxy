@@ -221,6 +221,89 @@ async def test_retry_helper_no_retry_on_unknown_exception(proxy_module):
     assert calls == 1
 
 
+# ---------- Fix 3: _with_retry OSError narrowing ----------
+#
+# Bare ``OSError`` is no longer caught — only the genuine network-flavoured
+# ``ConnectionError`` subfamily (ConnectionResetError, ConnectionAbortedError,
+# BrokenPipeError).  PermissionError / FileNotFoundError / etc. must fail
+# fast because they're always fatal configuration problems, never transient.
+
+@pytest.mark.asyncio
+async def test_retry_helper_permission_error_fails_fast(proxy_module):
+    """PermissionError is an OSError but NOT a ConnectionError — do not retry."""
+    calls = 0
+
+    async def fn():
+        nonlocal calls
+        calls += 1
+        raise PermissionError("denied")
+
+    with patch.object(proxy_module, "max_retries", 5):
+        with pytest.raises(PermissionError):
+            await proxy_module._with_retry(
+                fn, operation="test", request_id="t", base_delay_s=0.0
+            )
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_helper_file_not_found_fails_fast(proxy_module):
+    """FileNotFoundError is an OSError but NOT a ConnectionError — do not retry."""
+    calls = 0
+
+    async def fn():
+        nonlocal calls
+        calls += 1
+        raise FileNotFoundError("no such file")
+
+    with patch.object(proxy_module, "max_retries", 5):
+        with pytest.raises(FileNotFoundError):
+            await proxy_module._with_retry(
+                fn, operation="test", request_id="t", base_delay_s=0.0
+            )
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_helper_retries_connection_reset_error(proxy_module):
+    """ConnectionResetError (a genuine transport hiccup) should still retry."""
+    calls = 0
+
+    async def fn():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionResetError("peer went away")
+        return "ok"
+
+    with patch.object(proxy_module, "max_retries", 1):
+        result = await proxy_module._with_retry(
+            fn, operation="test", request_id="t", base_delay_s=0.0
+        )
+    assert result == "ok"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_helper_retries_broken_pipe_error(proxy_module):
+    """BrokenPipeError is a ConnectionError subclass — should retry."""
+    calls = 0
+
+    async def fn():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise BrokenPipeError("pipe closed")
+        return "ok"
+
+    with patch.object(proxy_module, "max_retries", 1):
+        result = await proxy_module._with_retry(
+            fn, operation="test", request_id="t", base_delay_s=0.0
+        )
+    assert result == "ok"
+    assert calls == 2
+
+
 # ---------- Config endpoint tests ----------
 
 @pytest.fixture

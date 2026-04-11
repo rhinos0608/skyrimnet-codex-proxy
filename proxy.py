@@ -698,13 +698,17 @@ def _save_config(data: dict) -> None:
 # Retried on:
 #   - network exceptions (``aiohttp.ClientConnectorError``,
 #     ``aiohttp.ServerDisconnectedError``, ``asyncio.TimeoutError``,
-#     ``OSError``)
+#     ``ConnectionError`` and its subclasses — ``ConnectionResetError``,
+#     ``ConnectionAbortedError``, ``BrokenPipeError``)
 #   - ``HTTPException`` whose ``status_code`` is in ``_DEFAULT_RETRY_STATUSES``
 #     (429, 500, 502, 503, 504)
 #
 # NOT retried on:
 #   - 401/403 (auth broken — fail fast)
 #   - other 4xx
+#   - bare ``OSError`` (e.g. ``PermissionError``, ``FileNotFoundError``,
+#     ``IsADirectoryError``) — these are fatal configuration problems, never
+#     transient; retrying them only masks the root cause
 #   - any other exception type
 
 _DEFAULT_RETRY_STATUSES: frozenset = frozenset({429, 500, 502, 503, 504})
@@ -738,9 +742,10 @@ async def _with_retry(
     """Call ``fn()`` (async, zero-arg) up to ``max_retries + 1`` times.
 
     Retries on:
-      - network exceptions (``aiohttp.ClientConnectorError``,
+      - network exceptions: ``aiohttp.ClientConnectorError``,
         ``aiohttp.ServerDisconnectedError``, ``asyncio.TimeoutError``,
-        ``OSError``)
+        ``ConnectionError`` (parent of ``ConnectionResetError``,
+        ``ConnectionAbortedError``, and ``BrokenPipeError``)
       - ``HTTPException`` whose ``status_code`` is in ``retry_on_status``
         (default: 429, 500, 502, 503, 504)
 
@@ -748,10 +753,21 @@ async def _with_retry(
       - ``HTTPException`` with status_code in ``_NO_RETRY_STATUSES``
         (401/403 — auth is broken, fail fast)
       - any other 4xx
+      - **bare ``OSError``** is deliberately NOT retried — a
+        ``PermissionError`` or ``FileNotFoundError`` is always fatal
+        (misconfiguration, not a transient upstream hiccup) and retrying
+        them would just mask the root cause.  Only the network-flavoured
+        ``ConnectionError`` subfamily above is retried.
       - any other exception type
 
     Between attempts, sleeps ``base_delay_s * 2**attempt`` seconds (exponential
     backoff, no jitter). On the final attempt the last exception is re-raised.
+
+    Note: the backoff schedule is computed from ``attempt`` alone (no wall-
+    clock arithmetic), so there is no need for ``time.monotonic()`` inside
+    this helper.  If future changes add elapsed-time accounting, prefer
+    ``time.monotonic()`` over ``time.time()`` so NTP adjustments can't cause
+    negative delays.
     """
     attempts = max_retries + 1
     last_exc: Optional[BaseException] = None
@@ -773,7 +789,10 @@ async def _with_retry(
             )
             await asyncio.sleep(delay)
         except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError,
-                asyncio.TimeoutError, OSError) as e:
+                asyncio.TimeoutError, ConnectionError) as e:
+            # ConnectionError covers ConnectionResetError, ConnectionAbortedError,
+            # and BrokenPipeError — all genuine transport hiccups.  Note we do
+            # NOT catch bare OSError here (see docstring).
             last_exc = e
             if attempt + 1 >= attempts:
                 raise
@@ -833,7 +852,12 @@ async def _open_stream_with_retry(
             )
             await asyncio.sleep(delay)
             continue
-        except (aiohttp.ServerDisconnectedError, asyncio.TimeoutError, OSError) as e:
+        except (aiohttp.ServerDisconnectedError, asyncio.TimeoutError,
+                ConnectionError) as e:
+            # Mirror _with_retry's narrowing: only genuine transport errors
+            # (ConnectionError = ConnectionResetError / ConnectionAbortedError
+            # / BrokenPipeError) are retried.  Bare OSError (e.g.
+            # PermissionError, FileNotFoundError) is fatal and must propagate.
             if attempt + 1 >= attempts:
                 raise HTTPException(status_code=502, detail=f"{operation} network error: {type(e).__name__}")
             delay = base_delay_s * (2 ** attempt)
@@ -1138,15 +1162,22 @@ class QwenAuthCache:
             return False
 
     async def refresh_if_needed(self) -> bool:
-        """Try to reload credentials from file (CLI manages token refresh)."""
+        """Try to reload credentials from file (CLI manages token refresh).
+
+        ``reload_from_file`` does synchronous disk I/O (``open``, ``json.load``,
+        ``os.path.getmtime``) — when the creds file lives on slow storage this
+        would otherwise block the event loop.  Run it in the default thread
+        pool so the loop stays responsive while we hold the refresh lock.
+        """
         if not self.is_expired():
             return True
         async with self._get_lock():
             # Double-check: another coroutine may have reloaded while we waited
             if not self.is_expired():
                 return True
-            # Re-read from file — the Qwen CLI may have refreshed the token
-            return self.reload_from_file()
+            # Re-read from file — the Qwen CLI may have refreshed the token.
+            # ``asyncio.to_thread`` keeps the blocking I/O off the event loop.
+            return await asyncio.to_thread(self.reload_from_file)
 
     def get_auth_headers(self) -> dict:
         return {
@@ -1383,14 +1414,22 @@ class AntigravityAuthCache:
         return self._legacy_account.session
 
     async def refresh_if_needed(self) -> bool:
-        """Refresh tokens for all accounts. Returns True if at least one is ready."""
+        """Refresh tokens for all accounts. Returns True if at least one is ready.
+
+        Snapshots ``self.accounts`` at entry so a concurrent
+        ``add_account``/``remove_account`` cannot mutate the list mid-loop
+        (the per-account ``await`` yields the event loop between iterations).
+        The final readiness check also uses the snapshot so the concurrency
+        window is fully closed.
+        """
         if self.accounts:
-            for account in self.accounts:
+            accounts_snapshot = list(self.accounts)
+            for account in accounts_snapshot:
                 if account.refresh_token:
                     await account.refresh_if_needed()
                     if account.is_ready and not account.session:
                         account.session = create_session()
-            return any(a.is_ready for a in self.accounts)
+            return any(a.is_ready for a in accounts_snapshot)
         # Legacy single-account mode
         return await self._legacy_account.refresh_if_needed()
 
@@ -5504,13 +5543,18 @@ _OAI_COMPATIBLE_PROVIDERS = (
 )
 
 
-def _resolve_oai_compatible(model: str) -> Optional[dict]:
+async def _resolve_oai_compatible(model: str) -> Optional[dict]:
     """Resolve an OpenAI-compatible provider for the given model name.
 
     Returns a dict with the endpoint, api_model, headers, aiohttp session, and
     an ``owns_session`` flag indicating whether the caller must close the
     session after use.  Returns ``None`` when the model does not belong to any
     OpenAI-compatible provider (e.g. ``claude-sonnet-4-6``).
+
+    This coroutine is async because the Qwen branch must go through
+    ``qwen_auth.refresh_if_needed()`` (which takes an ``asyncio.Lock``) rather
+    than calling ``reload_from_file`` directly — otherwise two concurrent
+    ``/v1/messages`` tool requests could race on the shared token state.
     """
     if is_ollama_model(model):
         api_model = model[len("ollama:"):]
@@ -5608,7 +5652,11 @@ def _resolve_oai_compatible(model: str) -> Optional[dict]:
         }
 
     if is_qwen_model(model):
-        qwen_auth.reload_from_file()
+        # Go through refresh_if_needed so the per-instance asyncio.Lock
+        # serialises concurrent token reloads.  Bypassing it (as the old
+        # direct reload_from_file() call did) races two coroutines on
+        # qwen_auth.access_token / .expires_at.
+        await qwen_auth.refresh_if_needed()
         if not qwen_auth.is_ready:
             raise HTTPException(status_code=503, detail="Qwen auth not ready")
         api_model = model[len("qwen:"):]
@@ -5739,7 +5787,7 @@ def _anthropic_tool_choice_to_oai(tool_choice):
     raise HTTPException(status_code=400, detail=f"Unsupported tool_choice type: {t!r}")
 
 
-def _anthropic_messages_to_oai_structured(messages: list) -> list[dict]:
+def _anthropic_messages_to_oai_structured(messages: list) -> tuple[list[dict], list[str]]:
     """Translate Anthropic-format messages into OpenAI chat messages for the
     structured tool_use passthrough path.
 
@@ -5754,11 +5802,19 @@ def _anthropic_messages_to_oai_structured(messages: list) -> list[dict]:
       - ``image`` blocks are collapsed to a text placeholder (this path does
         not claim vision parity).
       - Unknown block types raise HTTP 400.
+
+    Returns a tuple ``(oai_messages, in_array_system_texts)``.  In-array
+    ``{role: "system"}`` entries are NOT inserted into ``oai_messages`` — they
+    are collected into ``in_array_system_texts`` so the caller can merge them
+    with any top-level ``system`` field into a **single** system message at
+    index 0 (preventing duplicate system messages that several upstreams
+    reject).
     """
     if not isinstance(messages, list):
         raise HTTPException(status_code=400, detail="'messages' must be a list")
 
     oai: list[dict] = []
+    in_array_system_texts: list[str] = []
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
             raise HTTPException(status_code=400, detail=f"messages[{i}] must be an object")
@@ -5770,7 +5826,7 @@ def _anthropic_messages_to_oai_structured(messages: list) -> list[dict]:
         if role == "system":
             text = _anthropic_content_blocks_to_plain_text(content)
             if text:
-                oai.append({"role": "system", "content": text})
+                in_array_system_texts.append(text)
             continue
 
         if isinstance(content, str):
@@ -5861,7 +5917,7 @@ def _anthropic_messages_to_oai_structured(messages: list) -> list[dict]:
             if not text_parts and not tool_results:
                 oai.append({"role": "user", "content": ""})
 
-    return oai
+    return oai, in_array_system_texts
 
 
 def _anthropic_to_oai_structured(body: dict) -> dict:
@@ -5881,11 +5937,23 @@ def _anthropic_to_oai_structured(body: dict) -> dict:
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="'messages' required and must be non-empty")
 
-    oai_messages = _anthropic_messages_to_oai_structured(messages)
+    oai_messages, in_array_system_texts = _anthropic_messages_to_oai_structured(messages)
 
-    system_text = _anthropic_flatten_system(body.get("system"))
-    if system_text:
-        oai_messages.insert(0, {"role": "system", "content": system_text})
+    # Merge the top-level ``system`` field with any in-array system messages
+    # into EXACTLY ONE ``{role: "system"}`` entry at index 0.  Several OpenAI-
+    # compatible upstreams reject requests that contain more than one
+    # consecutive system message, so we collapse them here regardless of which
+    # combination the caller sent (top-level only, in-array only, or both).
+    top_level_system = _anthropic_flatten_system(body.get("system"))
+    system_parts: list[str] = []
+    if top_level_system:
+        system_parts.append(top_level_system)
+    system_parts.extend(in_array_system_texts)
+    if system_parts:
+        oai_messages.insert(0, {
+            "role": "system",
+            "content": "\n\n".join(system_parts),
+        })
 
     payload: dict = {"model": model, "messages": oai_messages}
 
@@ -6144,14 +6212,18 @@ def _openai_completion_to_anthropic_message(oai_resp: dict, request_model: str) 
     }
 
 
-def _format_anthropic_sse(event: str, data: dict) -> str:
+def _format_anthropic_sse(event: str, data: dict) -> bytes:
     """Format an Anthropic SSE event (named event + JSON data line).
 
-    Uses the project-wide ``json_dumps`` which is orjson-backed when
-    available, shaving meaningful latency off high-frequency text_delta
-    events in the streaming hot path.
+    Returns ``bytes`` directly rather than a ``str``.  ``json_dumps`` is
+    orjson-backed when available and always yields bytes; previously we
+    decoded those bytes into a UTF-8 string just so ``StreamingResponse``
+    could re-encode them back to bytes on the way out to the client.  In
+    the per-token streaming hot path that decode + re-encode cycle is pure
+    overhead — FastAPI's ``StreamingResponse`` accepts both ``str`` and
+    ``bytes`` chunks, so callers don't need to change.
     """
-    return f"event: {event}\ndata: {json_dumps(data).decode('utf-8')}\n\n"
+    return b"event: " + event.encode("ascii") + b"\ndata: " + json_dumps(data) + b"\n\n"
 
 
 async def _anthropic_stream_from_openai(
@@ -6310,6 +6382,12 @@ async def _anthropic_stream_from_openai(
                     "name": incoming_name or "",
                     "started": False,
                     "closed": False,
+                    # Buffers args that arrive BEFORE the function name (some
+                    # upstreams emit {arguments: "..."} on the same delta as
+                    # or before {function: {name: "..."}}).  These bytes are
+                    # flushed immediately after content_block_start so no
+                    # partial_json is silently dropped.
+                    "pending_args": "",
                 }
                 tool_state[idx] = state
                 next_block_index += 1
@@ -6335,19 +6413,37 @@ async def _anthropic_stream_from_openai(
                         },
                     },
                 )
-
-            if incoming_args and state["started"]:
-                yield _format_anthropic_sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": state["block_index"],
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": incoming_args,
+                # Flush any args that arrived before the name was revealed.
+                if state["pending_args"]:
+                    yield _format_anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": state["block_index"],
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": state["pending_args"],
+                            },
                         },
-                    },
-                )
+                    )
+                    state["pending_args"] = ""
+
+            if incoming_args:
+                if state["started"]:
+                    yield _format_anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": state["block_index"],
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": incoming_args,
+                            },
+                        },
+                    )
+                else:
+                    # Block not yet started (no name) — buffer for flush.
+                    state["pending_args"] += incoming_args
 
         fr = choice0.get("finish_reason")
         if fr and not finish_reason:
@@ -6546,7 +6642,7 @@ async def anthropic_messages(request: Request):
 
     # Route 1: structured tool_use passthrough.
     if has_tools:
-        resolved = _resolve_oai_compatible(resolved_model)
+        resolved = await _resolve_oai_compatible(resolved_model)
         if resolved is None:
             raise HTTPException(
                 status_code=400,

@@ -277,6 +277,74 @@ class TestRequestTranslation:
             proxy_module._anthropic_to_oai_structured(body)
         assert exc.value.status_code == 400
 
+    # ---- Fix 1: system message duplication / merging ----
+
+    def _system_messages(self, payload: dict) -> list[dict]:
+        return [m for m in payload["messages"] if m.get("role") == "system"]
+
+    def test_top_level_and_in_array_system_merge_into_one(self, proxy_module):
+        """Top-level ``system`` + in-array system message collapse into a
+        single OAI system entry with both texts (top-level first)."""
+        body = {
+            "model": "ollama:llama3.2",
+            "max_tokens": 50,
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "system", "content": "Also be brief."},
+                {"role": "user", "content": "hi"},
+            ],
+        }
+        payload = proxy_module._anthropic_to_oai_structured(body)
+        sys_msgs = self._system_messages(payload)
+        assert len(sys_msgs) == 1
+        assert sys_msgs[0] is payload["messages"][0]
+        # top-level first, in-array second, separated by blank line
+        assert sys_msgs[0]["content"] == "You are helpful.\n\nAlso be brief."
+
+    def test_two_in_array_system_messages_collapse_preserving_order(self, proxy_module):
+        body = {
+            "model": "ollama:llama3.2",
+            "max_tokens": 50,
+            "messages": [
+                {"role": "system", "content": "first rule"},
+                {"role": "system", "content": "second rule"},
+                {"role": "user", "content": "hi"},
+            ],
+        }
+        payload = proxy_module._anthropic_to_oai_structured(body)
+        sys_msgs = self._system_messages(payload)
+        assert len(sys_msgs) == 1
+        assert sys_msgs[0]["content"] == "first rule\n\nsecond rule"
+        # and it's at index 0, before the user message
+        assert payload["messages"][0]["role"] == "system"
+        assert payload["messages"][1]["role"] == "user"
+
+    def test_only_top_level_system_single_message_regression(self, proxy_module):
+        body = {
+            "model": "ollama:llama3.2",
+            "max_tokens": 50,
+            "system": "just top level",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        payload = proxy_module._anthropic_to_oai_structured(body)
+        sys_msgs = self._system_messages(payload)
+        assert len(sys_msgs) == 1
+        assert sys_msgs[0]["content"] == "just top level"
+
+    def test_only_single_in_array_system_message(self, proxy_module):
+        body = {
+            "model": "ollama:llama3.2",
+            "max_tokens": 50,
+            "messages": [
+                {"role": "system", "content": "only me"},
+                {"role": "user", "content": "hi"},
+            ],
+        }
+        payload = proxy_module._anthropic_to_oai_structured(body)
+        sys_msgs = self._system_messages(payload)
+        assert len(sys_msgs) == 1
+        assert sys_msgs[0]["content"] == "only me"
+
 
 # ----------------------------------------------------------------------------
 # Non-streaming response translation
@@ -401,9 +469,14 @@ async def _collect(aiter):
     return out
 
 
-def _parse_sse(events: list[str]) -> list[tuple[str, dict]]:
+def _parse_sse(events: list) -> list[tuple[str, dict]]:
     parsed = []
     for raw in events:
+        # _format_anthropic_sse now yields bytes directly (perf fix) so we
+        # decode here before the line-split.  Callers may also hand us plain
+        # strings (single-shot wrapper path) — accept both.
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8")
         event_type = None
         data = None
         for line in raw.split("\n"):
@@ -543,6 +616,64 @@ class TestStreamingResponseTranslation:
         assert md[1]["delta"]["stop_reason"] == "tool_use"
 
     @pytest.mark.asyncio
+    async def test_tool_call_args_before_name_are_buffered_and_flushed(self, proxy_module):
+        """Regression: some upstreams emit a tool_call delta carrying only
+        ``function.arguments`` BEFORE the delta that reveals
+        ``function.name``.  The pre-name args must be buffered and flushed
+        as an input_json_delta immediately after content_block_start so no
+        bytes are silently dropped."""
+        chunks = [
+            # First delta: NO name, just a fragment of arguments.
+            {"choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": 0, "id": "call_pre",
+                                "function": {"arguments": '{"a":'}}]
+            }, "finish_reason": None}]},
+            # Second delta: name appears.  At this moment the content block
+            # should start AND the buffered pre-name args should be flushed.
+            {"choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": 0,
+                                "function": {"name": "Bash"}}]
+            }, "finish_reason": None}]},
+            # Third delta: normal streaming args after the block is open.
+            {"choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": 0,
+                                "function": {"arguments": '1}'}}]
+            }, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {},
+                          "finish_reason": "tool_calls"}]},
+        ]
+        events = await _collect(
+            proxy_module._anthropic_stream_from_openai(_make_iter(chunks), "ollama:x", 0)
+        )
+        parsed = _parse_sse(events)
+
+        # Exactly one tool_use content block.
+        tool_starts = [
+            p for p in parsed
+            if p[0] == "content_block_start"
+            and p[1]["content_block"]["type"] == "tool_use"
+        ]
+        assert len(tool_starts) == 1
+        tool_start_idx = next(
+            i for i, p in enumerate(parsed)
+            if p[0] == "content_block_start"
+            and p[1]["content_block"]["type"] == "tool_use"
+        )
+
+        # The content_block_delta that immediately follows the tool_use
+        # content_block_start must carry the buffered pre-name fragment.
+        next_delta = parsed[tool_start_idx + 1]
+        assert next_delta[0] == "content_block_delta"
+        assert next_delta[1]["delta"]["type"] == "input_json_delta"
+        assert next_delta[1]["delta"]["partial_json"] == '{"a":'
+
+        # Full reassembled arguments preserved end-to-end.
+        deltas = [p[1]["delta"]["partial_json"] for p in parsed
+                  if p[0] == "content_block_delta"
+                  and p[1]["delta"]["type"] == "input_json_delta"]
+        assert "".join(deltas) == '{"a":1}'
+
+    @pytest.mark.asyncio
     async def test_text_only_dict_stream_regression(self, proxy_module):
         """Dict-chunk path must still produce a clean text-only response
         when no tool_calls are emitted."""
@@ -577,24 +708,28 @@ class TestStreamingResponseTranslation:
 
 class TestResolver:
 
-    def test_returns_none_for_claude(self, proxy_module):
-        assert proxy_module._resolve_oai_compatible("claude-sonnet-4-6") is None
+    @pytest.mark.asyncio
+    async def test_returns_none_for_claude(self, proxy_module):
+        assert await proxy_module._resolve_oai_compatible("claude-sonnet-4-6") is None
 
-    def test_returns_none_for_codex(self, proxy_module):
-        assert proxy_module._resolve_oai_compatible("gpt-5.3-codex") is None
+    @pytest.mark.asyncio
+    async def test_returns_none_for_codex(self, proxy_module):
+        assert await proxy_module._resolve_oai_compatible("gpt-5.3-codex") is None
 
-    def test_resolves_ollama(self, proxy_module):
+    @pytest.mark.asyncio
+    async def test_resolves_ollama(self, proxy_module):
         with patch.object(proxy_module, "ollama_session", _StubSession()):
-            resolved = proxy_module._resolve_oai_compatible("ollama:llama3.2")
+            resolved = await proxy_module._resolve_oai_compatible("ollama:llama3.2")
         assert resolved is not None
         assert resolved["api_model"] == "llama3.2"
         assert "chat/completions" in resolved["endpoint_url"]
         assert resolved["provider_name"] == "Ollama"
 
-    def test_resolves_openrouter(self, proxy_module):
+    @pytest.mark.asyncio
+    async def test_resolves_openrouter(self, proxy_module):
         with patch.object(proxy_module, "third_party_session", _StubSession()), \
              patch.object(proxy_module, "openrouter_api_key", "sk-test"):
-            resolved = proxy_module._resolve_oai_compatible(
+            resolved = await proxy_module._resolve_oai_compatible(
                 "openai/gpt-4o-mini"
             )
         assert resolved is not None

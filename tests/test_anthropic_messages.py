@@ -4,6 +4,20 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
+def _join_events(events) -> str:
+    """Concatenate SSE chunks for substring assertions.
+
+    ``_format_anthropic_sse`` now yields ``bytes`` directly (perf fix — see
+    proxy.py), but the single-shot wrapper path still yields ``str``.  This
+    helper normalises both into a single joined string so the existing
+    ``"Hel" in joined`` style assertions keep working.
+    """
+    return "".join(
+        c.decode("utf-8") if isinstance(c, (bytes, bytearray)) else c
+        for c in events
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — request translation helpers
 # ---------------------------------------------------------------------------
@@ -300,7 +314,7 @@ class TestStreamingTranslator:
         ):
             events.append(chunk)
 
-        joined = "".join(events)
+        joined = _join_events(events)
         assert "event: message_start" in joined
         assert "event: content_block_start" in joined
         assert "event: content_block_delta" in joined
@@ -323,7 +337,7 @@ class TestStreamingTranslator:
             fake_openai_stream(), "m", 0
         ):
             events.append(chunk)
-        joined = "".join(events)
+        joined = _join_events(events)
         assert '"stop_reason":"max_tokens"' in joined
 
     @pytest.mark.asyncio
@@ -338,7 +352,7 @@ class TestStreamingTranslator:
             fake_error_stream(), "m", 0
         ):
             events.append(chunk)
-        joined = "".join(events)
+        joined = _join_events(events)
         assert "API key missing" in joined
         assert "upstream error" in joined
         assert "content_block_delta" in joined
@@ -355,7 +369,7 @@ class TestStreamingTranslator:
             fake_error_stream(), "m", 0
         ):
             events.append(chunk)
-        assert "quota exceeded" in "".join(events)
+        assert "quota exceeded" in _join_events(events)
 
     @pytest.mark.asyncio
     async def test_upstream_exception_still_emits_message_stop(self, proxy_module):
@@ -371,7 +385,7 @@ class TestStreamingTranslator:
             exploding_stream(), "m", 0
         ):
             events.append(chunk)
-        joined = "".join(events)
+        joined = _join_events(events)
         assert "start" in joined
         assert "stream error" in joined
         assert "kaboom" in joined
@@ -390,7 +404,7 @@ class TestStreamingTranslator:
             fake_empty_stream(), "m", 0
         ):
             events.append(chunk)
-        joined = "".join(events)
+        joined = _join_events(events)
         # Must still produce message_start / content_block_start / ...stop / message_delta / message_stop
         assert "message_start" in joined
         assert "content_block_start" in joined
