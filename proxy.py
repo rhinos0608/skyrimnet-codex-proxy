@@ -6625,7 +6625,11 @@ async def anthropic_messages(request: Request):
          request is fed to a non-OAI provider).  Flattens everything through
          ``_chat_completions_inner`` and wraps the result as an Anthropic
          Message.  Requests with ``tools`` targeting a non-OAI provider are
-         rejected with HTTP 400.
+         soft-fallback'd onto this path with a warning logged: tool definitions
+         are dropped and the model produces a plain text reply, which keeps
+         clients like CCS working when they tier-route to claude-*/gpt-5.*/
+         antigravity-* models that can't dispatch tools natively through this
+         proxy.
     """
     try:
         body = await request.json()
@@ -6642,17 +6646,33 @@ async def anthropic_messages(request: Request):
 
     # Route 1: structured tool_use passthrough.
     if has_tools:
-        resolved = await _resolve_oai_compatible(resolved_model)
-        if resolved is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Tool passthrough only supports OpenAI-compatible providers: "
-                    + ", ".join(_OAI_COMPATIBLE_PROVIDERS)
-                    + f". Model {resolved_model!r} does not route to any of them."
-                ),
-            )
-        return await _anthropic_messages_structured(body, resolved, resolved_model, is_stream)
+        try:
+            resolved = await _resolve_oai_compatible(resolved_model)
+        except HTTPException:
+            # Explicit resolver failures (missing API key, etc.) still propagate.
+            raise
+        if resolved is not None:
+            return await _anthropic_messages_structured(body, resolved, resolved_model, is_stream)
+        # Soft-fallback: the requested model isn't OAI-compatible so we can't
+        # dispatch tools natively.  Flatten tools into the system prompt via the
+        # legacy text-only pipeline so the conversation keeps flowing under
+        # clients like CCS that tier-route to claude-*/gpt-5.*/antigravity-*
+        # models.  The assistant won't emit structured tool_use blocks — the
+        # caller gets a text response summarising what it would do.
+        logger.warning(
+            "[/v1/messages] Soft-fallback: tools present but model %r does not "
+            "route to an OAI-compatible provider (%s). Flattening through the "
+            "text-only path; tool dispatch is not available on this model.",
+            resolved_model, ", ".join(_OAI_COMPATIBLE_PROVIDERS),
+        )
+        # Strip tools from the body before handing off so the text path doesn't
+        # try to include the raw tool JSON in the prompt — the text translator
+        # already summarises tool defs into a system-prompt hint via
+        # _anthropic_tools_to_system_hint(), which is the right level of detail.
+        # We keep tool_use / tool_result blocks inside `messages` so the history
+        # flattening renders them as readable text.
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
 
     chat_req = _anthropic_request_to_chat_request(body)
 

@@ -792,23 +792,107 @@ class TestMessagesEndpointStructured:
         assert tool_blocks[0]["name"] == "Bash"
         assert tool_blocks[0]["input"] == {"cmd": "ls"}
 
-    def test_tools_on_non_oai_model_returns_400(self, test_client):
-        resp = test_client.post(
-            "/v1/messages",
-            json={
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 100,
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [{
-                    "name": "Bash",
-                    "description": "Run a command",
-                    "input_schema": {"type": "object"},
-                }],
-            },
-        )
-        assert resp.status_code == 400
-        detail = resp.json().get("detail", "")
-        assert "Tool passthrough" in detail or "OpenAI-compatible" in detail
+    def test_tools_on_non_oai_model_soft_fallback(self, test_client, proxy_module, caplog):
+        """Tools + non-OAI model now soft-falls-back onto the legacy text-only
+        path with a warning, instead of returning HTTP 400.  This keeps clients
+        like CCS (which tier-route to claude-*/gpt-5.*/antigravity-* models)
+        working — they just won't get structured tool dispatch on that turn."""
+        mock_auth = MagicMock(is_ready=True, session=MagicMock(), headers={},
+                              body_template={"messages": []})
+        with patch.object(proxy_module, "auth", mock_auth), \
+             patch.object(proxy_module, "call_api_direct",
+                          new_callable=AsyncMock,
+                          return_value="I would run that command for you."), \
+             patch.object(proxy_module, "request_stats", MagicMock(record=MagicMock())), \
+             caplog.at_level("WARNING", logger=proxy_module.logger.name):
+            resp = test_client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{
+                        "name": "Bash",
+                        "description": "Run a command",
+                        "input_schema": {"type": "object"},
+                    }],
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["type"] == "message"
+        assert body["content"][0]["type"] == "text"
+        assert body["content"][0]["text"] == "I would run that command for you."
+        # A WARNING log should have been emitted explaining the fallback.
+        warning_text = " ".join(r.getMessage() for r in caplog.records
+                                if r.levelname == "WARNING")
+        assert ("Soft-fallback" in warning_text
+                or "soft-fallback" in warning_text
+                or "does not route to an OAI-compatible provider" in warning_text)
+
+    def test_tools_on_non_oai_model_soft_fallback_streaming(self, test_client, proxy_module, caplog):
+        """Streaming variant of the soft-fallback: tools + claude-* + stream=True
+        must produce an Anthropic SSE stream (via the text-only pipeline) and
+        emit the Soft-fallback warning."""
+        async def _fake_claude_stream(system_prompt, messages, model, max_tokens):
+            # Emit a minimal OpenAI SSE stream with two text deltas, like the
+            # real call_api_streaming() does.
+            import json as _json
+            chunk1 = {
+                "id": "chatcmpl-test", "object": "chat.completion.chunk",
+                "created": 1, "model": model,
+                "choices": [{"index": 0, "delta": {"content": "Hello "},
+                             "finish_reason": None}],
+            }
+            chunk2 = {
+                "id": "chatcmpl-test", "object": "chat.completion.chunk",
+                "created": 1, "model": model,
+                "choices": [{"index": 0, "delta": {"content": "world"},
+                             "finish_reason": None}],
+            }
+            done = {
+                "id": "chatcmpl-test", "object": "chat.completion.chunk",
+                "created": 1, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {_json.dumps(chunk1)}\n\n"
+            yield f"data: {_json.dumps(chunk2)}\n\n"
+            yield f"data: {_json.dumps(done)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        mock_auth = MagicMock(is_ready=True, session=MagicMock(), headers={},
+                              body_template={"messages": []})
+        with patch.object(proxy_module, "auth", mock_auth), \
+             patch.object(proxy_module, "call_api_streaming",
+                          return_value=_fake_claude_stream(None, [], "claude-sonnet-4-6", 100)), \
+             patch.object(proxy_module, "timeout_routing_enabled", False), \
+             patch.object(proxy_module, "request_stats", MagicMock(record=MagicMock())), \
+             caplog.at_level("WARNING", logger=proxy_module.logger.name):
+            resp = test_client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 100,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{
+                        "name": "Bash",
+                        "description": "Run a command",
+                        "input_schema": {"type": "object"},
+                    }],
+                },
+            )
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers.get("content-type", "")
+        body = resp.text
+        assert "event: message_start" in body
+        assert "event: content_block_delta" in body
+        assert "event: message_stop" in body
+        warning_text = " ".join(r.getMessage() for r in caplog.records
+                                if r.levelname == "WARNING")
+        assert ("Soft-fallback" in warning_text
+                or "soft-fallback" in warning_text
+                or "does not route to an OAI-compatible provider" in warning_text)
 
     def test_without_tools_still_uses_text_fallback(self, test_client, proxy_module):
         """Regression: a tools-free /v1/messages POST must still go through
