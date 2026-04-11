@@ -695,6 +695,14 @@ class CodexAuthCache:
         self.session: Optional[aiohttp.ClientSession] = None
         self._token_endpoint = "https://auth.openai.com/oauth/token"
         self._client_id = "app_EMoamEEZ73f0CkXaXp7hrann"  # Codex CLI OAuth client ID
+        # Lazy-initialised lock — see _get_lock(). Prevents concurrent refresh races.
+        self._refresh_lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-init the refresh lock so it binds to the running event loop."""
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+        return self._refresh_lock
 
     @property
     def is_ready(self) -> bool:
@@ -713,6 +721,14 @@ class CodexAuthCache:
             logger.warning("Codex token expired but no refresh token available")
             return False
 
+        async with self._get_lock():
+            # Double-check: another coroutine may have refreshed while we waited
+            if not self.is_expired():
+                return True
+            return await self._do_refresh()
+
+    async def _do_refresh(self) -> bool:
+        """Perform the actual token refresh. Caller must hold self._refresh_lock."""
         logger.info("Refreshing Codex OAuth token...")
         try:
             async with aiohttp.ClientSession() as session:
@@ -763,6 +779,14 @@ class GeminiAuthCache:
         self.expires_at: Optional[datetime] = None
         self.session: Optional[aiohttp.ClientSession] = None
         self.project_id: Optional[str] = None
+        # Lazy-initialised lock — see _get_lock(). Prevents concurrent refresh races.
+        self._refresh_lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-init the refresh lock so it binds to the running event loop."""
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+        return self._refresh_lock
 
     @property
     def is_ready(self) -> bool:
@@ -779,6 +803,17 @@ class GeminiAuthCache:
             return True
         if not self.refresh_token:
             logger.warning("Gemini token expired but missing refresh_token")
+            return False
+
+        async with self._get_lock():
+            # Double-check: another coroutine may have refreshed while we waited
+            if not self.is_expired():
+                return True
+            return await self._do_refresh()
+
+    async def _do_refresh(self) -> bool:
+        """Perform the actual token refresh. Caller must hold self._refresh_lock."""
+        if not self.refresh_token:
             return False
 
         # Use credentials from file if present, otherwise fall back to Gemini CLI built-in creds
@@ -840,6 +875,14 @@ class QwenAuthCache:
         self.expires_at: Optional[datetime] = None
         self.session: Optional[aiohttp.ClientSession] = None
         self._file_mtime: float = 0  # Track credential file changes
+        # Lazy-initialised lock — see _get_lock(). Prevents concurrent refresh races.
+        self._refresh_lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-init the refresh lock so it binds to the running event loop."""
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+        return self._refresh_lock
 
     @property
     def is_ready(self) -> bool:
@@ -886,8 +929,12 @@ class QwenAuthCache:
         """Try to reload credentials from file (CLI manages token refresh)."""
         if not self.is_expired():
             return True
-        # Re-read from file — the Qwen CLI may have refreshed the token
-        return self.reload_from_file()
+        async with self._get_lock():
+            # Double-check: another coroutine may have reloaded while we waited
+            if not self.is_expired():
+                return True
+            # Re-read from file — the Qwen CLI may have refreshed the token
+            return self.reload_from_file()
 
     def get_auth_headers(self) -> dict:
         return {
@@ -941,6 +988,15 @@ class AntigravityAccount:
         self.project_id: Optional[str] = None
         self.session: Optional[aiohttp.ClientSession] = None
         self._error_count: int = 0  # Track consecutive errors for this account
+        # Lazy-initialised lock — see _get_lock(). Prevents concurrent refresh races
+        # across coroutines sharing this account.
+        self._refresh_lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-init the refresh lock so it binds to the running event loop."""
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+        return self._refresh_lock
 
     @property
     def is_ready(self) -> bool:
@@ -987,6 +1043,14 @@ class AntigravityAccount:
             logger.warning(f"Antigravity token expired for {self.email} but no refresh token available")
             return False
 
+        async with self._get_lock():
+            # Double-check: another coroutine may have refreshed while we waited
+            if not self.is_expired():
+                return True
+            return await self._do_refresh()
+
+    async def _do_refresh(self) -> bool:
+        """Perform the actual token refresh. Caller must hold self._refresh_lock."""
         logger.info(f"Refreshing Antigravity OAuth token for {self.email}...")
         try:
             async with aiohttp.ClientSession() as session:
