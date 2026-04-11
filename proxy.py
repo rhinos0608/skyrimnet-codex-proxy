@@ -6665,13 +6665,14 @@ async def anthropic_messages(request: Request):
             "text-only path; tool dispatch is not available on this model.",
             resolved_model, ", ".join(_OAI_COMPATIBLE_PROVIDERS),
         )
-        # Strip tools from the body before handing off so the text path doesn't
-        # try to include the raw tool JSON in the prompt — the text translator
-        # already summarises tool defs into a system-prompt hint via
-        # _anthropic_tools_to_system_hint(), which is the right level of detail.
-        # We keep tool_use / tool_result blocks inside `messages` so the history
-        # flattening renders them as readable text.
-        body.pop("tools", None)
+        # Keep ``tools`` in the body: _anthropic_request_to_chat_request calls
+        # _anthropic_tools_to_system_hint() which folds the tool catalogue into
+        # the system prompt as a human-readable bullet list, so the model still
+        # knows what capabilities exist even though it can't emit structured
+        # tool_use blocks.  We only drop ``tool_choice``, which is an OpenAI-
+        # specific dispatch directive whose semantics don't apply on the text
+        # path.  tool_use / tool_result blocks inside ``messages`` are already
+        # flattened to readable text by _anthropic_flatten_content().
         body.pop("tool_choice", None)
 
     chat_req = _anthropic_request_to_chat_request(body)

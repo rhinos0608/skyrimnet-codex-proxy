@@ -796,13 +796,17 @@ class TestMessagesEndpointStructured:
         """Tools + non-OAI model now soft-falls-back onto the legacy text-only
         path with a warning, instead of returning HTTP 400.  This keeps clients
         like CCS (which tier-route to claude-*/gpt-5.*/antigravity-* models)
-        working — they just won't get structured tool dispatch on that turn."""
+        working — they just won't get structured tool dispatch on that turn.
+
+        Also asserts that the tool catalogue DOES reach the model via the
+        text path's ``_anthropic_tools_to_system_hint`` — dropping tool
+        dispatch should not mean dropping tool awareness.
+        """
         mock_auth = MagicMock(is_ready=True, session=MagicMock(), headers={},
                               body_template={"messages": []})
+        mock_direct = AsyncMock(return_value="I would run that command for you.")
         with patch.object(proxy_module, "auth", mock_auth), \
-             patch.object(proxy_module, "call_api_direct",
-                          new_callable=AsyncMock,
-                          return_value="I would run that command for you."), \
+             patch.object(proxy_module, "call_api_direct", mock_direct), \
              patch.object(proxy_module, "request_stats", MagicMock(record=MagicMock())), \
              caplog.at_level("WARNING", logger=proxy_module.logger.name):
             resp = test_client.post(
@@ -829,6 +833,14 @@ class TestMessagesEndpointStructured:
         assert ("Soft-fallback" in warning_text
                 or "soft-fallback" in warning_text
                 or "does not route to an OAI-compatible provider" in warning_text)
+        # The text path should have surfaced the tool catalogue into the
+        # system prompt so the model still knows Bash exists even though it
+        # cannot dispatch it structurally.
+        assert mock_direct.await_args is not None
+        system_prompt_arg = mock_direct.await_args.args[0]
+        assert system_prompt_arg is not None
+        assert "Bash" in system_prompt_arg
+        assert "Run a command" in system_prompt_arg
 
     def test_tools_on_non_oai_model_soft_fallback_streaming(self, test_client, proxy_module, caplog):
         """Streaming variant of the soft-fallback: tools + claude-* + stream=True
