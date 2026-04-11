@@ -9,3 +9,16 @@ capture_*.py
 *.log
 .venv/
 venv/
+.proxy.key
+stats.json
+
+# Secrets & local config
+config.json
+antigravity-auth.json
+
+# Runtime logs / checkpoints
+.conversation-log.jsonl
+.task-checkpoint.jsonl
+
+# OS
+.DS_Store
