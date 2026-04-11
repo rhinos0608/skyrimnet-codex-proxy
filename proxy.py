@@ -42,16 +42,6 @@ from cryptography.fernet import Fernet
 # reduces pauses without accumulating long-lived garbage.
 gc.set_threshold(10000, 20, 20)
 
-# orjson (optional) — 3-5x faster serialisation for large request bodies.
-# Falls back to stdlib json transparently if not installed.
-try:
-    import orjson as _json_lib
-    def json_dumps(obj: object) -> bytes:
-        return _json_lib.dumps(obj)
-except ImportError:
-    def json_dumps(obj: object) -> bytes:  # type: ignore[misc]
-        return json.dumps(obj).encode("utf-8")
-
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,6 +52,62 @@ import aiohttp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("proxy")
+
+# --- Phase 1 refactor: re-exports from proxy_internal package ---
+# These functions and constants used to live in this file; they were moved
+# to proxy_internal/ to start breaking up the monolith.  Every symbol below
+# is re-exported at module scope so that (a) tests that call
+# proxy.<name>(...) keep working, (b) mcp_server.py and any downstream code
+# that does ``from proxy import <name>`` keeps resolving, and (c) internal
+# call sites in the rest of this file keep working without edits.
+from proxy_internal._json import json_dumps
+from proxy_internal.encryption import (
+    KEY_FILE,
+    _ENC_PREFIX,
+    _get_fernet,
+    _encrypt_value,
+    _decrypt_value,
+)
+from proxy_internal.config_store import (
+    CONFIG_FILE,
+    _ENCRYPTED_CONFIG_FIELDS,
+    _load_config,
+    _save_config,
+    _load_max_retries,
+)
+from proxy_internal.sse_utils import (
+    make_sse_error_chunk,
+    make_sse_content_chunk,
+    yield_sse_error,
+    _format_anthropic_sse,
+)
+from proxy_internal.message_normalize import (
+    _CLAUDE_TEMPLATE_STRIPPED_FIELDS,
+    _sanitize_claude_template,
+    _extract_oai_content,
+    _is_reasoning_truncated,
+    _has_reasoning_without_content,
+    _strip_vision_content,
+    build_oai_messages,
+    _append_merged_message,
+    _normalize_chat_messages,
+)
+from proxy_internal.model_detect import (
+    parse_model_list,
+    is_ollama_model,
+    is_openrouter_model,
+    is_codex_model,
+    is_antigravity_model,
+    is_gemini_cli_model,
+    is_zai_model,
+    is_xiaomi_model,
+    is_opencode_model,
+    is_qwen_model,
+    is_fireworks_model,
+    is_nvidia_model,
+    _MODEL_ALIASES,
+    normalize_model_name,
+)
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
@@ -309,9 +355,6 @@ def _json_serialize(obj: object) -> str:
 # so downstream consumers (SkyrimNet) only see plain content.
 _REASONING_FIELDS = {"reasoning", "reasoning_content", "reasoning_details"}
 
-# Fields that should never be retained from Claude CLI auth-capture templates.
-_CLAUDE_TEMPLATE_STRIPPED_FIELDS = {"tools", "thinking", "context_management", "tool_choice", "system"}
-
 
 _CHAT_ALLOWED_EXTRA = {
     "temperature",
@@ -327,142 +370,6 @@ _CHAT_ALLOWED_EXTRA = {
 }
 
 
-def _sanitize_claude_template(parsed: dict) -> dict:
-    """Return a minimal Claude request template without prompt/tool baggage."""
-    sanitized = dict(parsed)
-    for field in _CLAUDE_TEMPLATE_STRIPPED_FIELDS:
-        sanitized.pop(field, None)
-    return sanitized
-
-
-def _extract_oai_content(message: dict) -> Optional[str]:
-    """Extract usable text from an OpenAI-format message, handling reasoning models.
-
-    Reasoning models (GLM, Kimi, MiMo) may return content=null/empty while the actual
-    output sits in 'reasoning' or 'reasoning_content'.  When content is empty and
-    reasoning is present, we return None so the caller can handle it (e.g. retry
-    without max_tokens).  We do NOT return reasoning as content because it's the
-    model's internal chain-of-thought, not the answer.
-    """
-    return message.get("content") or None
-
-
-def _is_reasoning_truncated(data: dict) -> bool:
-    """Check if an OpenAI-format response was truncated mid-reasoning.
-
-    Returns True when finish_reason is 'length' and content is empty but
-    reasoning_content is present — meaning max_tokens was exhausted by the
-    model's chain-of-thought before it could produce actual output.
-    """
-    choices = data.get("choices", [])
-    if not choices:
-        return False
-    choice = choices[0]
-    if choice.get("finish_reason") != "length":
-        return False
-    msg = choice.get("message", {})
-    content = msg.get("content")
-    reasoning = msg.get("reasoning_content") or msg.get("reasoning")
-    return (not content) and bool(reasoning)
-
-
-def _has_reasoning_without_content(data: dict) -> bool:
-    """Return True when a choice carries reasoning fields but no user-visible content."""
-    choices = data.get("choices", [])
-    if not choices:
-        return False
-    msg = choices[0].get("message", {})
-    content = msg.get("content")
-    reasoning = msg.get("reasoning_content") or msg.get("reasoning")
-    return (not content) and bool(reasoning)
-
-
-def _strip_vision_content(content):
-    """Collapse multimodal content blocks to text-only.
-
-    If *content* is a list of dicts (OpenAI vision format), extract only the
-    text parts and return a plain string.  Plain strings pass through unchanged.
-    """
-    if isinstance(content, list):
-        parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-        return " ".join(p for p in parts if p) or ""
-    return content
-
-
-def build_oai_messages(system_prompt: Optional[str], messages: list, *, strip_vision: bool = False) -> list:
-    """Build an OpenAI-format message list, prepending system prompt if present."""
-    oai = []
-    if system_prompt:
-        oai.append({"role": "system", "content": system_prompt})
-    for m in messages:
-        content = m["content"]
-        if strip_vision:
-            content = _strip_vision_content(content)
-        oai.append({"role": m["role"], "content": content})
-    return oai
-
-
-def _append_merged_message(messages: list[dict], role: str, content) -> None:
-    """Append a message, coalescing adjacent messages from the same role.
-
-    Content can be a string or a list (for vision/multimodal messages).
-    """
-    # Convert Pydantic models to native Python types
-    if hasattr(content, "__iter__") and not isinstance(content, str):
-        # List of Pydantic models - convert to dicts
-        content = [
-            c.model_dump() if hasattr(c, "model_dump") else
-            c.dict() if hasattr(c, "dict") else c
-            for c in content
-        ]
-
-    if messages and messages[-1]["role"] == role:
-        prev_content = messages[-1]["content"]
-        if isinstance(prev_content, str) and isinstance(content, str):
-            messages[-1]["content"] += "\n\n" + content
-        elif isinstance(prev_content, list) and isinstance(content, list):
-            messages[-1]["content"].extend(content)
-        else:
-            # Mixed types, can't coalesce - append new message
-            messages.append({"role": role, "content": content})
-    else:
-        messages.append({"role": role, "content": content})
-
-
-def _normalize_chat_messages(messages: list) -> tuple[Optional[str], list[dict], list[dict]]:
-    """Build provider-native and OpenAI-compatible views of the incoming chat history."""
-    system_parts: list[str] = []
-    merged_messages: list[dict] = []
-    oai_messages: list[dict] = []
-
-    for msg in messages:
-        role = msg.role if hasattr(msg, "role") else msg["role"]
-        content = msg.content if hasattr(msg, "content") else msg["content"]
-
-        # Convert content to native Python types
-        if hasattr(content, "__iter__") and not isinstance(content, str):
-            content = [
-                c.model_dump() if hasattr(c, "model_dump") else
-                c.dict() if hasattr(c, "dict") else c
-                for c in content
-            ]
-
-        if role == "system":
-            # System messages are always strings
-            if isinstance(content, list):
-                content = " ".join(c.get("text", "") for c in content if c.get("text"))
-            system_parts.append(content)
-            _append_merged_message(oai_messages, role, content)
-        elif role in ("user", "assistant"):
-            _append_merged_message(merged_messages, role, content)
-            _append_merged_message(oai_messages, role, content)
-
-    if merged_messages and merged_messages[0]["role"] != "user":
-        merged_messages.insert(0, {"role": "user", "content": "Continue."})
-
-    return "\n\n".join(system_parts) or None, merged_messages, oai_messages
-
-
 def _model_uses_oai_messages(model: str) -> bool:
     """Return True for providers that accept OpenAI-format chat messages directly."""
     return (
@@ -475,33 +382,6 @@ def _model_uses_oai_messages(model: str) -> bool:
         or is_fireworks_model(model)
         or is_nvidia_model(model)
     )
-
-
-def make_sse_error_chunk(model: str, error_msg: str) -> str:
-    """Build a single SSE error chunk in OpenAI chat.completion.chunk format."""
-    cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
-    chunk = {
-        "id": cmpl_id, "object": "chat.completion.chunk",
-        "created": int(time.time()), "model": model,
-        "choices": [{"index": 0, "delta": {"content": error_msg}, "finish_reason": None}],
-    }
-    return f"data: {json.dumps(chunk)}\n\n"
-
-
-def make_sse_content_chunk(model: str, content: str) -> str:
-    """Build a single SSE content chunk in OpenAI chat.completion.chunk format."""
-    cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
-    chunk = {
-        "id": cmpl_id, "object": "chat.completion.chunk",
-        "created": int(time.time()), "model": model,
-        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-    }
-    return f"data: {json.dumps(chunk)}\n\n"
-
-
-def yield_sse_error(model: str, error_msg: str):
-    """Return (error_chunk, done_marker) strings for SSE error responses."""
-    return make_sse_error_chunk(model, error_msg), "data: [DONE]\n\n"
 
 
 async def passthrough_sse(resp, request_id: str, provider_name: str, start: float):
@@ -586,90 +466,10 @@ def _get_codex_command() -> tuple[str, list[str]]:
 
     return (CODEX_PATH, [])
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".proxy.key")
-
 # --- Token encryption ---
 
-# Fields in config.json that contain secrets and should be encrypted at rest.
-_ENCRYPTED_CONFIG_FIELDS = {"openrouter_api_key", "ollama_api_key", "zai_api_key", "xiaomi_api_key", "opencode_api_key", "opencode_go_api_key", "fireworks_api_key", "nvidia_api_key"}
 # Fields in antigravity-auth account dicts that should be encrypted.
 _ENCRYPTED_AUTH_FIELDS = {"refresh_token", "access_token"}
-_ENC_PREFIX = "enc:"
-
-
-def _get_fernet() -> Fernet:
-    """Return a Fernet instance, generating a key file on first use."""
-    if not os.path.exists(KEY_FILE):
-        key = Fernet.generate_key()
-        with open(KEY_FILE, "wb") as f:
-            f.write(key)
-        # Restrict permissions (best-effort on Windows)
-        try:
-            os.chmod(KEY_FILE, 0o600)
-        except OSError:
-            pass
-        logger.info("Generated new encryption key (.proxy.key)")
-    with open(KEY_FILE, "rb") as f:
-        return Fernet(f.read().strip())
-
-
-def _encrypt_value(fernet: Fernet, value: str) -> str:
-    """Encrypt a plaintext string, returning an 'enc:...' token."""
-    return _ENC_PREFIX + fernet.encrypt(value.encode("utf-8")).decode("ascii")
-
-
-def _decrypt_value(fernet: Fernet, value: str) -> str:
-    """Decrypt an 'enc:...' token back to plaintext. Returns as-is if not encrypted."""
-    if not isinstance(value, str) or not value.startswith(_ENC_PREFIX):
-        return value
-    return fernet.decrypt(value[len(_ENC_PREFIX):].encode("ascii")).decode("utf-8")
-
-
-def _load_config() -> dict:
-    """Load persisted config from disk, decrypting secret fields."""
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    fernet = _get_fernet()
-    migrated = False
-    for field in _ENCRYPTED_CONFIG_FIELDS:
-        val = data.get(field)
-        if isinstance(val, str) and val:
-            if val.startswith(_ENC_PREFIX):
-                data[field] = _decrypt_value(fernet, val)
-            else:
-                # Plaintext on disk — encrypt it in place for next load.
-                migrated = True
-    if migrated:
-        _save_config(data)
-    return data
-
-
-def _save_config(data: dict) -> None:
-    """Persist config dict to disk, encrypting secret fields.
-
-    Writes atomically via write-then-rename so a crash or a concurrent save
-    cannot leave ``config.json`` half-written — a torn write would corrupt
-    the Fernet ciphertexts and lock the user out of every stored API key.
-    """
-    fernet = _get_fernet()
-    out = dict(data)
-    for field in _ENCRYPTED_CONFIG_FIELDS:
-        val = out.get(field)
-        if isinstance(val, str) and val and not val.startswith(_ENC_PREFIX):
-            out[field] = _encrypt_value(fernet, val)
-    tmp_path = f"{CONFIG_FILE}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass  # fsync unsupported on some filesystems — best effort
-    os.replace(tmp_path, CONFIG_FILE)
 
 
 # --- Retry policy ---
@@ -713,22 +513,6 @@ def _save_config(data: dict) -> None:
 
 _DEFAULT_RETRY_STATUSES: frozenset = frozenset({429, 500, 502, 503, 504})
 _NO_RETRY_STATUSES: frozenset = frozenset({401, 403})
-
-
-def _load_max_retries(cfg: Optional[dict] = None) -> int:
-    """Clamp max_retries from config into the legal 0..10 range.
-
-    Accepts either an already-loaded config dict or ``None`` to re-read from
-    disk.  Default is 1 (one try, one retry).
-    """
-    if cfg is None:
-        cfg = _load_config()
-    raw = cfg.get("max_retries", 1)
-    try:
-        n = int(raw)
-    except (TypeError, ValueError):
-        n = 1
-    return max(0, min(10, n))
 
 
 async def _with_retry(
@@ -1844,102 +1628,12 @@ async def _stats_persist_loop() -> None:
 _load_stats_from_disk()
 
 
-def parse_model_list(model_field: str) -> list[str]:
-    """Parse comma-separated model list from request, trimming whitespace."""
-    return [m.strip() for m in model_field.split(",") if m.strip()]
-
-
 def pick_model_round_robin(models: list[str]) -> str:
     """Pick next model from list using round-robin."""
     global _round_robin_counter
     model = models[_round_robin_counter % len(models)]
     _round_robin_counter += 1
     return model
-
-
-def is_ollama_model(model: str) -> bool:
-    """Ollama models use 'ollama:model' or 'ollama:model:tag' prefix."""
-    return model.lower().startswith("ollama:")
-
-
-def is_openrouter_model(model: str) -> bool:
-    """OpenRouter models use 'provider/model' format (contain '/').
-    Excludes models with known prefixes (e.g. fireworks:, nvidia:) that may contain slashes."""
-    low = model.lower()
-    if low.startswith("fireworks:") or low.startswith("nvidia:"):
-        return False
-    return "/" in model
-
-
-def is_codex_model(model: str) -> bool:
-    """Codex/OpenAI models use gpt-5.*-codex* naming or codex-* naming."""
-    model_lower = model.lower()
-    return (
-        model_lower.startswith("gpt-5.") or
-        model_lower.startswith("gpt-5-") or
-        model_lower.startswith("codex-")
-    )
-
-
-def is_antigravity_model(model: str) -> bool:
-    """Antigravity models use antigravity-* naming."""
-    model_lower = model.lower()
-    return (
-        model_lower.startswith("antigravity-") or
-        model_lower.startswith("gemini-3") or
-        model_lower.startswith("gemini-2.5") or
-        model_lower.startswith("gpt-oss-")
-    )
-
-
-def is_gemini_cli_model(model: str) -> bool:
-    """Gemini CLI models use gcli-* prefix."""
-    return model.lower().startswith("gcli-")
-
-
-def is_zai_model(model: str) -> bool:
-    """Z.AI models use 'zai:model' prefix."""
-    return model.lower().startswith("zai:")
-
-
-def is_xiaomi_model(model: str) -> bool:
-    """Xiaomi models use 'xiaomi:model' prefix."""
-    return model.lower().startswith("xiaomi:")
-
-
-def is_opencode_model(model: str) -> bool:
-    """OpenCode models use 'opencode:model' or 'opencode-go:model' prefix."""
-    m = model.lower()
-    return m.startswith("opencode:") or m.startswith("opencode-go:")
-
-
-def is_qwen_model(model: str) -> bool:
-    """Qwen Code models use 'qwen:model' prefix."""
-    return model.lower().startswith("qwen:")
-
-
-def is_fireworks_model(model: str) -> bool:
-    """Fireworks models use 'fireworks:model' prefix."""
-    return model.lower().startswith("fireworks:")
-
-
-def is_nvidia_model(model: str) -> bool:
-    """NVIDIA NIM models use 'nvidia:model' prefix."""
-    return model.lower().startswith("nvidia:")
-
-
-# Canonical model name aliases — dot-version notation → hyphen notation used by the API
-_MODEL_ALIASES: dict[str, str] = {
-    "claude-sonnet-4.6": "claude-sonnet-4-6",
-    "claude-opus-4.6": "claude-opus-4-6",
-    "claude-haiku-4.5": "claude-haiku-4-5-20251001",
-    "claude-sonnet-4.5": "claude-sonnet-4-5-20250929",
-}
-
-
-def normalize_model_name(model: str) -> str:
-    """Resolve known model aliases to their canonical API identifiers."""
-    return _MODEL_ALIASES.get(model, model)
 
 
 def _pick_fallback_model(exclude_model: str) -> str:
@@ -6214,20 +5908,6 @@ def _openai_completion_to_anthropic_message(oai_resp: dict, request_model: str) 
             "output_tokens": int(output_tokens),
         },
     }
-
-
-def _format_anthropic_sse(event: str, data: dict) -> bytes:
-    """Format an Anthropic SSE event (named event + JSON data line).
-
-    Returns ``bytes`` directly rather than a ``str``.  ``json_dumps`` is
-    orjson-backed when available and always yields bytes; previously we
-    decoded those bytes into a UTF-8 string just so ``StreamingResponse``
-    could re-encode them back to bytes on the way out to the client.  In
-    the per-token streaming hot path that decode + re-encode cycle is pure
-    overhead — FastAPI's ``StreamingResponse`` accepts both ``str`` and
-    ``bytes`` chunks, so callers don't need to change.
-    """
-    return b"event: " + event.encode("ascii") + b"\ndata: " + json_dumps(data) + b"\n\n"
 
 
 async def _anthropic_stream_from_openai(
