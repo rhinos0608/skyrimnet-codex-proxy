@@ -5143,6 +5143,553 @@ def _anthropic_request_to_chat_request(body: dict) -> "ChatRequest":
     return ChatRequest(**chat_payload)
 
 
+# ---------------------------------------------------------------------------
+# Anthropic /v1/messages — structured tool_use passthrough path
+#
+# The text-only translator above flattens tool_use/tool_result blocks into
+# plain text so the backend sees a conversational summary.  For clients that
+# require the assistant to actually fire tools (Claude Code, Anthropic SDK
+# agents), the helpers below offer a separate pipeline that routes directly
+# to OpenAI-compatible providers and preserves structured tool calls on both
+# the request and response sides.  Non-OAI-compatible providers (Claude native,
+# Codex CLI, Antigravity, Gemini CLI) cannot participate because their upstream
+# response format does not emit OpenAI-style tool_calls.
+# ---------------------------------------------------------------------------
+
+_OAI_COMPATIBLE_PROVIDERS = (
+    "OpenRouter", "Ollama", "Z.AI", "Xiaomi",
+    "OpenCode", "Qwen", "Fireworks", "NVIDIA NIM",
+)
+
+
+def _resolve_oai_compatible(model: str) -> Optional[dict]:
+    """Resolve an OpenAI-compatible provider for the given model name.
+
+    Returns a dict with the endpoint, api_model, headers, aiohttp session, and
+    an ``owns_session`` flag indicating whether the caller must close the
+    session after use.  Returns ``None`` when the model does not belong to any
+    OpenAI-compatible provider (e.g. ``claude-sonnet-4-6``).
+    """
+    if is_ollama_model(model):
+        api_model = model[len("ollama:"):]
+        if ollama_api_key:
+            endpoint = "https://ollama.com/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {ollama_api_key}",
+                "Content-Type": "application/json",
+            }
+        else:
+            endpoint = "http://localhost:11434/v1/chat/completions"
+            headers = {"Content-Type": "application/json"}
+        session = ollama_session or auth.session or create_session()
+        owns_session = not ollama_session and not auth.session
+        return {
+            "endpoint_url": endpoint,
+            "api_model": api_model,
+            "headers": headers,
+            "session": session,
+            "owns_session": owns_session,
+            "provider_name": "Ollama",
+        }
+
+    if is_openrouter_model(model):
+        if not openrouter_api_key:
+            raise HTTPException(status_code=503, detail="OpenRouter API key not configured")
+        session = third_party_session or auth.session or create_session()
+        owns_session = session is not third_party_session and session is not auth.session
+        return {
+            "endpoint_url": "https://openrouter.ai/api/v1/chat/completions",
+            "api_model": model,
+            "headers": {
+                "Authorization": f"Bearer {openrouter_api_key}",
+                "Content-Type": "application/json",
+            },
+            "session": session,
+            "owns_session": owns_session,
+            "provider_name": "OpenRouter",
+        }
+
+    if is_zai_model(model):
+        if not zai_api_key:
+            raise HTTPException(status_code=503, detail="Z.AI API key not configured")
+        api_model = model[len("zai:"):]
+        session = third_party_session or auth.session or create_session()
+        owns_session = session is not third_party_session and session is not auth.session
+        return {
+            "endpoint_url": f"{ZAI_BASE_URL}/chat/completions",
+            "api_model": api_model,
+            "headers": {
+                "Authorization": f"Bearer {zai_api_key}",
+                "Content-Type": "application/json",
+            },
+            "session": session,
+            "owns_session": owns_session,
+            "provider_name": "Z.AI",
+        }
+
+    if is_xiaomi_model(model):
+        if not xiaomi_api_key:
+            raise HTTPException(status_code=503, detail="Xiaomi API key not configured")
+        api_model = model[len("xiaomi:"):]
+        base = XIAOMI_PLATFORM_URL if api_model in _XIAOMI_PLATFORM_MODELS else XIAOMI_BASE_URL
+        session = third_party_session or auth.session or create_session()
+        owns_session = session is not third_party_session and session is not auth.session
+        return {
+            "endpoint_url": f"{base}/chat/completions",
+            "api_model": api_model,
+            "headers": {
+                "Authorization": f"Bearer {xiaomi_api_key}",
+                "Content-Type": "application/json",
+            },
+            "session": session,
+            "owns_session": owns_session,
+            "provider_name": "Xiaomi",
+        }
+
+    if is_opencode_model(model):
+        api_model, base_url, api_key, plan = _resolve_opencode(model)
+        if not api_key:
+            raise HTTPException(status_code=503, detail=f"OpenCode {plan} API key not configured")
+        session = third_party_session or auth.session or create_session()
+        owns_session = session is not third_party_session and session is not auth.session
+        return {
+            "endpoint_url": f"{base_url}/chat/completions",
+            "api_model": api_model,
+            "headers": {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "opencode/1.3.10",
+            },
+            "session": session,
+            "owns_session": owns_session,
+            "provider_name": f"OpenCode {plan}",
+        }
+
+    if is_qwen_model(model):
+        qwen_auth.reload_from_file()
+        if not qwen_auth.is_ready:
+            raise HTTPException(status_code=503, detail="Qwen auth not ready")
+        api_model = model[len("qwen:"):]
+        session = qwen_auth.session or create_session()
+        owns_session = not qwen_auth.session
+        return {
+            "endpoint_url": f"{QWEN_BASE_URL}/chat/completions",
+            "api_model": api_model,
+            "headers": qwen_auth.get_auth_headers(),
+            "session": session,
+            "owns_session": owns_session,
+            "provider_name": "Qwen",
+        }
+
+    if is_fireworks_model(model):
+        if not fireworks_api_key:
+            raise HTTPException(status_code=503, detail="Fireworks API key not configured")
+        api_model = _resolve_fireworks_model(model)
+        session = third_party_session or auth.session or create_session()
+        owns_session = session is not third_party_session and session is not auth.session
+        return {
+            "endpoint_url": f"{FIREWORKS_BASE_URL}/chat/completions",
+            "api_model": api_model,
+            "headers": {
+                "Authorization": f"Bearer {fireworks_api_key}",
+                "Content-Type": "application/json",
+            },
+            "session": session,
+            "owns_session": owns_session,
+            "provider_name": "Fireworks",
+        }
+
+    if is_nvidia_model(model):
+        if not nvidia_api_key:
+            raise HTTPException(status_code=503, detail="NVIDIA NIM API key not configured")
+        api_model = _resolve_nvidia_model(model)
+        session = third_party_session or auth.session or create_session()
+        owns_session = session is not third_party_session and session is not auth.session
+        return {
+            "endpoint_url": f"{NVIDIA_BASE_URL}/chat/completions",
+            "api_model": api_model,
+            "headers": {
+                "Authorization": f"Bearer {nvidia_api_key}",
+                "Content-Type": "application/json",
+            },
+            "session": session,
+            "owns_session": owns_session,
+            "provider_name": "NVIDIA NIM",
+        }
+
+    return None
+
+
+def _anthropic_content_blocks_to_plain_text(content) -> str:
+    """Flatten a tool_result content field (string or block list) to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and block.get("text") is not None:
+                    parts.append(str(block["text"]))
+                elif "text" in block:
+                    parts.append(str(block["text"]))
+                else:
+                    try:
+                        parts.append(json.dumps(block))
+                    except (TypeError, ValueError):
+                        parts.append(str(block))
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    try:
+        return json.dumps(content)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _anthropic_tools_to_oai(tools) -> list[dict]:
+    """Translate Anthropic tool defs to OpenAI function tool defs."""
+    if not isinstance(tools, list):
+        raise HTTPException(status_code=400, detail="'tools' must be a list")
+    oai_tools: list[dict] = []
+    for i, t in enumerate(tools):
+        if not isinstance(t, dict):
+            raise HTTPException(status_code=400, detail=f"tools[{i}] must be an object")
+        name = t.get("name")
+        if not name or not isinstance(name, str):
+            raise HTTPException(status_code=400, detail=f"tools[{i}] missing 'name'")
+        description = t.get("description") or ""
+        schema = t.get("input_schema") or t.get("parameters") or {"type": "object", "properties": {}}
+        if not isinstance(schema, dict):
+            raise HTTPException(status_code=400, detail=f"tools[{i}] input_schema must be an object")
+        oai_tools.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": schema,
+            },
+        })
+    return oai_tools
+
+
+def _anthropic_tool_choice_to_oai(tool_choice):
+    """Translate Anthropic tool_choice to OpenAI tool_choice."""
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str) and tool_choice in ("auto", "none", "required"):
+        return tool_choice
+    if not isinstance(tool_choice, dict):
+        raise HTTPException(status_code=400, detail="tool_choice must be an object or string")
+    t = tool_choice.get("type")
+    if t == "auto":
+        return "auto"
+    if t == "any":
+        return "required"
+    if t == "none":
+        return "none"
+    if t == "tool":
+        name = tool_choice.get("name")
+        if not name:
+            raise HTTPException(status_code=400, detail="tool_choice type=tool requires 'name'")
+        return {"type": "function", "function": {"name": name}}
+    raise HTTPException(status_code=400, detail=f"Unsupported tool_choice type: {t!r}")
+
+
+def _anthropic_messages_to_oai_structured(messages: list) -> list[dict]:
+    """Translate Anthropic-format messages into OpenAI chat messages for the
+    structured tool_use passthrough path.
+
+    Rules:
+      - ``tool_use`` blocks in an assistant message become entries in that
+        message's ``tool_calls`` array (with content=None when there was no
+        accompanying text).
+      - ``tool_result`` blocks in a user message become separate
+        ``{role: "tool", tool_call_id, content}`` messages immediately after
+        any text from the same user message.
+      - Plain ``text`` blocks are concatenated.
+      - ``image`` blocks are collapsed to a text placeholder (this path does
+        not claim vision parity).
+      - Unknown block types raise HTTP 400.
+    """
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="'messages' must be a list")
+
+    oai: list[dict] = []
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            raise HTTPException(status_code=400, detail=f"messages[{i}] must be an object")
+        role = msg.get("role")
+        content = msg.get("content")
+        if role not in ("user", "assistant", "system"):
+            raise HTTPException(status_code=400, detail=f"messages[{i}] has unknown role {role!r}")
+
+        if role == "system":
+            text = _anthropic_content_blocks_to_plain_text(content)
+            if text:
+                oai.append({"role": "system", "content": text})
+            continue
+
+        if isinstance(content, str):
+            oai.append({"role": role, "content": content})
+            continue
+        if content is None:
+            oai.append({"role": role, "content": ""})
+            continue
+        if not isinstance(content, list):
+            raise HTTPException(
+                status_code=400,
+                detail=f"messages[{i}].content must be string or list",
+            )
+
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        tool_results: list[dict] = []
+        for j, block in enumerate(content):
+            if not isinstance(block, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"messages[{i}].content[{j}] must be an object",
+                )
+            btype = block.get("type")
+            if btype == "text":
+                if block.get("text"):
+                    text_parts.append(str(block["text"]))
+            elif btype == "tool_use":
+                tu_id = block.get("id")
+                tu_name = block.get("name")
+                tu_input = block.get("input", {})
+                if not tu_id or not tu_name:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"messages[{i}].content[{j}] tool_use missing id/name",
+                    )
+                try:
+                    arg_str = json.dumps(tu_input) if not isinstance(tu_input, str) else tu_input
+                except (TypeError, ValueError):
+                    arg_str = "{}"
+                tool_calls.append({
+                    "id": tu_id,
+                    "type": "function",
+                    "function": {"name": tu_name, "arguments": arg_str},
+                })
+            elif btype == "tool_result":
+                tr_id = block.get("tool_use_id")
+                if not tr_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"messages[{i}].content[{j}] tool_result missing tool_use_id",
+                    )
+                tr_text = _anthropic_content_blocks_to_plain_text(block.get("content"))
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": tr_id,
+                    "content": tr_text,
+                })
+            elif btype == "image":
+                src = block.get("source") or {}
+                if src.get("type") == "base64":
+                    media = src.get("media_type", "image/png")
+                    data = src.get("data", "")
+                    text_parts.append(f"[image: data:{media};base64,{len(data)}B]")
+                elif src.get("type") == "url":
+                    text_parts.append(f"[image: {src.get('url', '')}]")
+            elif btype == "thinking":
+                continue
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"messages[{i}].content[{j}] unknown type {btype!r}",
+                )
+
+        if role == "assistant":
+            out: dict = {"role": "assistant"}
+            if text_parts:
+                out["content"] = "\n".join(text_parts)
+            else:
+                out["content"] = None if tool_calls else ""
+            if tool_calls:
+                out["tool_calls"] = tool_calls
+            oai.append(out)
+        else:  # user
+            if text_parts:
+                oai.append({"role": "user", "content": "\n".join(text_parts)})
+            oai.extend(tool_results)
+            if not text_parts and not tool_results:
+                oai.append({"role": "user", "content": ""})
+
+    return oai
+
+
+def _anthropic_to_oai_structured(body: dict) -> dict:
+    """Translate an Anthropic /v1/messages body into a structured OpenAI payload.
+
+    Preserves tool defs, tool_choice, tool_use blocks, and tool_result blocks
+    end-to-end so OpenAI-compatible upstreams can dispatch tools natively.
+    """
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="request body must be an object")
+
+    model = body.get("model")
+    if not model or not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="'model' is required")
+
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="'messages' required and must be non-empty")
+
+    oai_messages = _anthropic_messages_to_oai_structured(messages)
+
+    system_text = _anthropic_flatten_system(body.get("system"))
+    if system_text:
+        oai_messages.insert(0, {"role": "system", "content": system_text})
+
+    payload: dict = {"model": model, "messages": oai_messages}
+
+    max_tokens = body.get("max_tokens")
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        payload["max_tokens"] = max_tokens
+
+    for k in ("temperature", "top_p"):
+        if body.get(k) is not None:
+            payload[k] = body[k]
+
+    stop = body.get("stop_sequences")
+    if stop:
+        payload["stop"] = stop
+
+    if body.get("tools"):
+        payload["tools"] = _anthropic_tools_to_oai(body["tools"])
+        tc = body.get("tool_choice")
+        tc_oai = _anthropic_tool_choice_to_oai(tc)
+        if tc_oai is not None:
+            payload["tool_choice"] = tc_oai
+
+    if body.get("stream"):
+        payload["stream"] = True
+
+    return payload
+
+
+async def _call_oai_compatible_direct(resolved: dict, payload: dict, request_id: str) -> dict:
+    """POST a structured OpenAI payload to a resolved provider and return the raw JSON.
+
+    Single-shot — no retry, no timeout routing.  Raises HTTPException on any
+    non-200 response and on network errors.
+    """
+    session: aiohttp.ClientSession = resolved["session"]
+    endpoint: str = resolved["endpoint_url"]
+    headers: dict = resolved["headers"]
+    provider = resolved["provider_name"]
+
+    send_payload = dict(payload)
+    send_payload["model"] = resolved["api_model"]
+    send_payload.pop("stream", None)
+
+    logger.info(
+        f"[{request_id}] -> {provider} structured direct "
+        f"({send_payload['model']}, {len(send_payload.get('messages', []))} msgs)"
+    )
+    try:
+        async with session.post(endpoint, json=send_payload, headers=headers) as resp:
+            if resp.status != 200:
+                error_body = await resp.text()
+                logger.error(f"[{request_id}] {provider} {resp.status}: {error_body[:300]}")
+                raise HTTPException(status_code=resp.status, detail=error_body[:500])
+            return await resp.json()
+    except HTTPException:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        logger.error(f"[{request_id}] {provider} structured direct error: {e}")
+        raise HTTPException(status_code=502, detail=f"{provider} error: {e}")
+    finally:
+        if resolved.get("owns_session"):
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+
+async def _stream_oai_compatible(resolved: dict, payload: dict, request_id: str):
+    """POST a structured OpenAI payload with stream=True, yielding parsed dict chunks.
+
+    Decoupling the SSE framing from the translator keeps
+    ``_anthropic_stream_from_openai`` backward-compatible with the legacy
+    string-based upstreams while letting this generator hand out already-parsed
+    dicts.  Yields each OpenAI chat.completion.chunk as a dict.  Terminates on
+    ``data: [DONE]``.
+    """
+    session: aiohttp.ClientSession = resolved["session"]
+    endpoint: str = resolved["endpoint_url"]
+    headers: dict = resolved["headers"]
+    provider = resolved["provider_name"]
+
+    send_payload = dict(payload)
+    send_payload["model"] = resolved["api_model"]
+    send_payload["stream"] = True
+
+    logger.info(
+        f"[{request_id}] -> {provider} structured stream "
+        f"({send_payload['model']}, {len(send_payload.get('messages', []))} msgs)"
+    )
+    try:
+        async with session.post(endpoint, json=send_payload, headers=headers) as resp:
+            if resp.status != 200:
+                error_body = await resp.text()
+                logger.error(f"[{request_id}] {provider} {resp.status}: {error_body[:300]}")
+                raise HTTPException(status_code=resp.status, detail=error_body[:500])
+
+            buffer = bytearray()
+            async for raw_chunk in resp.content.iter_any():
+                buffer.extend(raw_chunk)
+                while True:
+                    idx = buffer.find(b"\n\n")
+                    if idx < 0:
+                        break
+                    event_bytes = bytes(buffer[:idx]).strip()
+                    del buffer[:idx + 2]
+                    if not event_bytes:
+                        continue
+                    event_text = event_bytes.decode("utf-8", errors="replace")
+                    data_lines: list[str] = []
+                    for line in event_text.split("\n"):
+                        line = line.strip()
+                        if line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+                    if not data_lines:
+                        continue
+                    data_str = "\n".join(data_lines)
+                    if data_str == "[DONE]":
+                        return
+                    try:
+                        yield json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+            tail = bytes(buffer).strip()
+            if tail:
+                for line in tail.decode("utf-8", errors="replace").split("\n"):
+                    line = line.strip()
+                    if line.startswith("data:"):
+                        data_str = line[5:].lstrip()
+                        if data_str and data_str != "[DONE]":
+                            try:
+                                yield json.loads(data_str)
+                            except json.JSONDecodeError:
+                                pass
+    except HTTPException:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        logger.error(f"[{request_id}] {provider} stream error: {e}")
+        raise HTTPException(status_code=502, detail=f"{provider} stream error: {e}")
+    finally:
+        if resolved.get("owns_session"):
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+
 def _approx_tokens(text: str) -> int:
     """Cheap token estimate used for usage reporting (chars / 4)."""
     if not text:
@@ -5150,12 +5697,86 @@ def _approx_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _normalize_tool_use_id(raw_id: Optional[str]) -> str:
+    """Return a tool_use id, generating a fresh toolu_ prefixed one when missing.
+
+    Upstream OpenAI tool_call ids (e.g. ``call_abc123``) are preserved verbatim so
+    round-trips (tool_use id → client tool_result tool_use_id → next turn's
+    tool_call.id) stay consistent.  Only genuinely missing ids get a new toolu_
+    identifier.
+    """
+    if raw_id:
+        return raw_id
+    return f"toolu_{uuid.uuid4().hex[:16]}"
+
+
+def _openai_tool_calls_to_anthropic_blocks(tool_calls) -> list[dict]:
+    """Translate an OpenAI message.tool_calls array into Anthropic tool_use blocks."""
+    if not tool_calls or not isinstance(tool_calls, list):
+        return []
+    blocks: list[dict] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        args_raw = fn.get("arguments")
+        # arguments may be a JSON string (OpenAI) or already a dict (defensive)
+        if isinstance(args_raw, str):
+            args_raw = args_raw.strip()
+            if not args_raw:
+                tool_input: dict = {}
+            else:
+                try:
+                    parsed = json.loads(args_raw)
+                except json.JSONDecodeError:
+                    parsed = {"_raw_arguments": args_raw}
+                tool_input = parsed if isinstance(parsed, dict) else {"value": parsed}
+        elif isinstance(args_raw, dict):
+            tool_input = args_raw
+        elif args_raw is None:
+            tool_input = {}
+        else:
+            tool_input = {"value": args_raw}
+        blocks.append({
+            "type": "tool_use",
+            "id": _normalize_tool_use_id(tc.get("id")),
+            "name": name,
+            "input": tool_input,
+        })
+    return blocks
+
+
 def _openai_completion_to_anthropic_message(oai_resp: dict, request_model: str) -> dict:
-    """Translate a non-streaming OpenAI chat.completion dict to an Anthropic message."""
+    """Translate a non-streaming OpenAI chat.completion dict to an Anthropic message.
+
+    Emits tool_use content blocks whenever ``choices[0].message.tool_calls`` is
+    populated.  When no tool_calls are present the output is still a single
+    text block (possibly empty) so the text-only path's consumers keep working.
+    """
     choice = (oai_resp.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     text = message.get("content") or ""
     finish_reason = choice.get("finish_reason") or "stop"
+    tool_calls = message.get("tool_calls") or []
+
+    content_blocks: list[dict] = []
+    if tool_calls:
+        # When tool_calls are present, only include a text block if there is
+        # actual text content — an empty text block would be noise.
+        if isinstance(text, str) and text:
+            content_blocks.append({"type": "text", "text": text})
+        content_blocks.extend(_openai_tool_calls_to_anthropic_blocks(tool_calls))
+        # Ensure finish_reason drives stop_reason to tool_use even if upstream
+        # forgot to set it — presence of tool_calls is authoritative.
+        if finish_reason not in ("tool_calls", "function_call"):
+            finish_reason = "tool_calls"
+    else:
+        # Preserve legacy text-only behaviour: always emit one text block,
+        # even when content is empty, so existing /v1/messages consumers
+        # keep seeing a single-block content array.
+        content_blocks.append({"type": "text", "text": text})
+
     stop_reason = _ANTHROPIC_STOP_REASON_MAP.get(finish_reason, "end_turn")
 
     usage = oai_resp.get("usage") or {}
@@ -5171,7 +5792,7 @@ def _openai_completion_to_anthropic_message(oai_resp: dict, request_model: str) 
         "type": "message",
         "role": "assistant",
         "model": request_model,
-        "content": [{"type": "text", "text": text}],
+        "content": content_blocks,
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
@@ -5198,14 +5819,34 @@ async def _anthropic_stream_from_openai(
 ):
     """Wrap an OpenAI SSE async iterator and emit Anthropic Messages SSE events.
 
-    The upstream generator yields OpenAI chat.completion.chunk SSE lines ending
-    with 'data: [DONE]\\n\\n'.  We parse text deltas out of them and re-emit as
-    Anthropic message_start / content_block_* / message_delta / message_stop.
+    Accepts two chunk shapes:
+      - **strings** — SSE-formatted lines ending with ``data: [DONE]\\n\\n`` (the
+        legacy text-only path used by non-tool /v1/messages requests)
+      - **dicts** — already-parsed OpenAI chat.completion.chunk objects (the
+        structured tool-use path fed by ``_stream_oai_compatible``)
+
+    Emits Anthropic message_start / content_block_* / message_delta / message_stop.
+    Tool-call deltas open new ``tool_use`` content blocks, with ``input_json_delta``
+    chunks carrying partial JSON for the ``function.arguments`` field.
     """
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     output_chars = 0
     finish_reason: Optional[str] = None
-    content_block_open = False
+
+    # Content block state.  Index 0 is always pre-opened as a text block so
+    # the legacy text-only flow works without extra bookkeeping — if the stream
+    # then emits tool_calls we close index 0 before opening tool_use blocks.
+    text_block_index = 0
+    next_block_index = 1
+    text_block_open = True  # index 0 opened in the header below
+    # tool_state[openai_delta_index] = {
+    #     "block_index": int,
+    #     "id": str,
+    #     "name": str,
+    #     "started": bool,  # content_block_start already emitted
+    #     "closed": bool,
+    # }
+    tool_state: dict[int, dict] = {}
 
     # Opening events.
     message_start_payload = {
@@ -5227,15 +5868,160 @@ async def _anthropic_stream_from_openai(
     yield _format_anthropic_sse("message_start", message_start_payload)
     yield _format_anthropic_sse(
         "content_block_start",
-        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_start", "index": text_block_index,
+         "content_block": {"type": "text", "text": ""}},
     )
-    content_block_open = True
+
+    def _close_text_block_events() -> list[str]:
+        """Return events to close the initial text block when a tool_call arrives."""
+        nonlocal text_block_open
+        if not text_block_open:
+            return []
+        text_block_open = False
+        return [_format_anthropic_sse(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": text_block_index},
+        )]
+
+    def _close_tool_block_events(state: dict) -> list[str]:
+        if state.get("closed") or not state.get("started"):
+            state["closed"] = True
+            return []
+        state["closed"] = True
+        return [_format_anthropic_sse(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": state["block_index"]},
+        )]
+
+    def _process_payload(payload: dict):
+        """Yield Anthropic SSE events for one parsed OpenAI chunk dict."""
+        nonlocal output_chars, finish_reason, next_block_index, text_block_open
+
+        # Error-envelope chunks (some providers send these without a choices array)
+        if isinstance(payload.get("error"), (str, dict)) and not payload.get("choices"):
+            err_payload = payload["error"]
+            err_text = err_payload if isinstance(err_payload, str) else \
+                err_payload.get("message") or json.dumps(err_payload)
+            err_text = f"[upstream error] {err_text}"
+            output_chars += len(err_text)
+            yield _format_anthropic_sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": text_block_index,
+                    "delta": {"type": "text_delta", "text": err_text},
+                },
+            )
+            return
+
+        choices = payload.get("choices") or []
+        if not choices:
+            return
+        choice0 = choices[0]
+        delta = choice0.get("delta") or {}
+
+        # Text content delta — route to the open text block at index 0.
+        delta_text = delta.get("content")
+        if isinstance(delta_text, str) and delta_text:
+            # If a tool block is open and we receive text again, we keep the
+            # text going into the original text block at index 0 — but only
+            # if it's still open.  If the upstream had already emitted
+            # tool_calls and closed index 0, we skip extra text (rare).
+            if text_block_open:
+                output_chars += len(delta_text)
+                yield _format_anthropic_sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": text_block_index,
+                        "delta": {"type": "text_delta", "text": delta_text},
+                    },
+                )
+
+        # Tool-call deltas — open/continue tool_use blocks
+        tool_call_deltas = delta.get("tool_calls") or []
+        for tcd in tool_call_deltas:
+            if not isinstance(tcd, dict):
+                continue
+            idx = tcd.get("index")
+            if idx is None:
+                idx = 0
+            fn = tcd.get("function") or {}
+            incoming_id = tcd.get("id")
+            incoming_name = fn.get("name")
+            incoming_args = fn.get("arguments") or ""
+
+            state = tool_state.get(idx)
+            if state is None:
+                # First time we see this tool_call index.  Close the initial
+                # text block (if still open) and close any previous tool block
+                # so Anthropic content blocks don't overlap.
+                for evt in _close_text_block_events():
+                    yield evt
+                for prev in tool_state.values():
+                    for evt in _close_tool_block_events(prev):
+                        yield evt
+
+                state = {
+                    "block_index": next_block_index,
+                    "id": incoming_id or "",
+                    "name": incoming_name or "",
+                    "started": False,
+                    "closed": False,
+                }
+                tool_state[idx] = state
+                next_block_index += 1
+
+            # Learn id/name lazily as upstream reveals them
+            if incoming_id and not state["id"]:
+                state["id"] = incoming_id
+            if incoming_name and not state["name"]:
+                state["name"] = incoming_name
+
+            if not state["started"] and state["name"]:
+                state["started"] = True
+                yield _format_anthropic_sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": state["block_index"],
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": _normalize_tool_use_id(state["id"]),
+                            "name": state["name"],
+                            "input": {},
+                        },
+                    },
+                )
+
+            if incoming_args and state["started"]:
+                yield _format_anthropic_sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": state["block_index"],
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": incoming_args,
+                        },
+                    },
+                )
+
+        fr = choice0.get("finish_reason")
+        if fr and not finish_reason:
+            finish_reason = fr
 
     buffer = ""
     upstream_error: Optional[str] = None
     try:
         async for raw_chunk in openai_iter:
-            # The upstream generator yields strings (SSE-formatted).  Normalise.
+            # Dict chunks (structured path) — dispatch directly.
+            if isinstance(raw_chunk, dict):
+                for evt in _process_payload(raw_chunk):
+                    yield evt
+                continue
+
+            # The legacy upstream yields strings (SSE-formatted).  Normalise.
             if isinstance(raw_chunk, bytes):
                 raw_chunk = raw_chunk.decode("utf-8", errors="replace")
             if not isinstance(raw_chunk, str):
@@ -5255,44 +6041,8 @@ async def _anthropic_stream_from_openai(
                         payload = json.loads(payload_str)
                     except json.JSONDecodeError:
                         continue
-                    # A few providers surface pre-flight failures as raw
-                    # {"error": ...} chunks with no choices array.  Fold
-                    # them into a text_delta so the client sees the reason
-                    # rather than a silently-empty stream.
-                    if isinstance(payload.get("error"), (str, dict)) and not payload.get("choices"):
-                        err_payload = payload["error"]
-                        err_text = err_payload if isinstance(err_payload, str) else \
-                            err_payload.get("message") or json.dumps(err_payload)
-                        err_text = f"[upstream error] {err_text}"
-                        output_chars += len(err_text)
-                        yield _format_anthropic_sse(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": err_text},
-                            },
-                        )
-                        continue
-                    choices = payload.get("choices") or []
-                    if not choices:
-                        continue
-                    choice0 = choices[0]
-                    delta = choice0.get("delta") or {}
-                    delta_text = delta.get("content")
-                    if delta_text:
-                        output_chars += len(delta_text)
-                        yield _format_anthropic_sse(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": delta_text},
-                            },
-                        )
-                    fr = choice0.get("finish_reason")
-                    if fr and not finish_reason:
-                        finish_reason = fr
+                    for evt in _process_payload(payload):
+                        yield evt
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
             aiohttp.ClientError, asyncio.CancelledError):
         # Client-side disconnects and upstream aborts — re-raise after the
@@ -5310,23 +6060,41 @@ async def _anthropic_stream_from_openai(
                 "content_block_delta",
                 {
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": text_block_index,
                     "delta": {"type": "text_delta", "text": f"[stream error] {upstream_error}"},
                 },
             )
         except Exception:
             pass
     finally:
-        if content_block_open:
+        # Close the initial text block if it's still open
+        if text_block_open:
             try:
                 yield _format_anthropic_sse(
                     "content_block_stop",
-                    {"type": "content_block_stop", "index": 0},
+                    {"type": "content_block_stop", "index": text_block_index},
                 )
             except Exception:
                 pass
+            text_block_open = False
+        # Close any open tool_use blocks
+        for state in tool_state.values():
+            if state.get("started") and not state.get("closed"):
+                try:
+                    yield _format_anthropic_sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": state["block_index"]},
+                    )
+                except Exception:
+                    pass
+                state["closed"] = True
+
         if upstream_error and not finish_reason:
             finish_reason = "stop"
+        # Presence of any tool_use blocks forces stop_reason=tool_use even if
+        # upstream forgot to set finish_reason=tool_calls.
+        if tool_state and (not finish_reason or finish_reason == "stop"):
+            finish_reason = "tool_calls"
         stop_reason = _ANTHROPIC_STOP_REASON_MAP.get(finish_reason or "stop", "end_turn")
         try:
             yield _format_anthropic_sse(
@@ -5342,21 +6110,113 @@ async def _anthropic_stream_from_openai(
             pass
 
 
+async def _anthropic_messages_structured(
+    body: dict,
+    resolved: dict,
+    request_model: str,
+    is_stream: bool,
+):
+    """Execute the structured tool_use path for an already-resolved provider.
+
+    Builds the OpenAI payload via :func:`_anthropic_to_oai_structured`, then
+    either calls :func:`_call_oai_compatible_direct` (non-streaming) or streams
+    dict chunks from :func:`_stream_oai_compatible` through the shared
+    :func:`_anthropic_stream_from_openai` translator.  Request-level stats are
+    recorded in the same shape as the legacy /v1/chat/completions pipeline.
+    """
+    request_id = uuid.uuid4().hex[:8]
+    payload = _anthropic_to_oai_structured(body)
+
+    # Rough prompt-token estimate (same chars/4 heuristic as the legacy path).
+    prompt_chars = 0
+    for m in payload.get("messages") or []:
+        content = m.get("content")
+        if isinstance(content, str):
+            prompt_chars += len(content)
+    prompt_tokens_hint = prompt_chars // 4
+
+    if is_stream:
+        payload["stream"] = True
+
+        async def _tracked_stream():
+            start = time.time()
+            had_error = True
+            try:
+                chunks = _stream_oai_compatible(resolved, payload, request_id)
+                async for evt in _anthropic_stream_from_openai(
+                    chunks, request_model, prompt_tokens_hint
+                ):
+                    yield evt
+                had_error = False
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                    aiohttp.ClientOSError, aiohttp.ServerDisconnectedError):
+                logger.debug("Client disconnected mid-/v1/messages structured stream")
+            finally:
+                request_stats.record(
+                    request_model, "streaming", time.time() - start, not had_error
+                )
+
+        return StreamingResponse(
+            _tracked_stream(),
+            media_type="text/event-stream",
+            headers=_STREAMING_HEADERS,
+        )
+
+    payload.pop("stream", None)
+    start = time.time()
+    try:
+        data = await _call_oai_compatible_direct(resolved, payload, request_id)
+        result = _openai_completion_to_anthropic_message(data, request_model)
+        request_stats.record(request_model, "direct", time.time() - start, True)
+        return result
+    except Exception:
+        request_stats.record(request_model, "direct", time.time() - start, False)
+        raise
+
+
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     """Anthropic Messages API compatibility endpoint.
 
-    Translates the request to the existing OpenAI chat-completions pipeline and
-    translates the response back.  Supports streaming and non-streaming.
+    Two code paths:
+      1. **Structured tool-use path** — taken when the caller supplies ``tools``
+         AND the model routes to an OpenAI-compatible provider.  Preserves
+         ``tool_use`` / ``tool_result`` blocks on both request and response so
+         clients like Claude Code can dispatch tools end-to-end.
+      2. **Legacy text-only path** — taken when no tools are requested (or the
+         request is fed to a non-OAI provider).  Flattens everything through
+         ``_chat_completions_inner`` and wraps the result as an Anthropic
+         Message.  Requests with ``tools`` targeting a non-OAI provider are
+         rejected with HTTP 400.
     """
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    chat_req = _anthropic_request_to_chat_request(body)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
     request_model = body.get("model") or DEFAULT_MODEL
+    resolved_model = normalize_model_name(request_model)
     is_stream = bool(body.get("stream"))
+    has_tools = bool(body.get("tools"))
+
+    # Route 1: structured tool_use passthrough.
+    if has_tools:
+        resolved = _resolve_oai_compatible(resolved_model)
+        if resolved is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Tool passthrough only supports OpenAI-compatible providers: "
+                    + ", ".join(_OAI_COMPATIBLE_PROVIDERS)
+                    + f". Model {resolved_model!r} does not route to any of them."
+                ),
+            )
+        return await _anthropic_messages_structured(body, resolved, resolved_model, is_stream)
+
+    chat_req = _anthropic_request_to_chat_request(body)
 
     # Rough prompt-token estimate for the message_start usage field.
     try:
