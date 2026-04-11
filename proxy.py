@@ -108,6 +108,16 @@ from proxy_internal.model_detect import (
     _MODEL_ALIASES,
     normalize_model_name,
 )
+# --- Phase 2 facade imports: retry helpers + streaming ---
+# (populated by Phase 2 extraction)
+# --- Phase 3 facade imports: provider modules ---
+# (populated by Phase 3 extraction)
+# --- Phase 4 facade imports: auth cache classes + loaders ---
+# (populated by Phase 4 extraction)
+# --- Phase 5 facade imports: FastAPI schemas + routers ---
+# (populated by Phase 5 extraction)
+# --- Phase 6 facade imports: interceptors + tailscale ---
+# (populated by Phase 6 extraction)
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
