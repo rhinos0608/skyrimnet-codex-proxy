@@ -109,7 +109,14 @@ from proxy_internal.model_detect import (
     normalize_model_name,
 )
 # --- Phase 2 facade imports: retry helpers + streaming ---
-# (populated by Phase 2 extraction)
+from proxy_internal.retry import (
+    _DEFAULT_RETRY_STATUSES,
+    _NO_RETRY_STATUSES,
+    _with_retry,
+    _open_stream_with_retry,
+)
+from proxy_internal.streaming import _REASONING_FIELDS, passthrough_sse
+from proxy_internal.message_normalize import _model_uses_oai_messages
 # --- Phase 3 facade imports: provider modules ---
 # (populated by Phase 3 extraction)
 # --- Phase 4 facade imports: auth cache classes + loaders ---
@@ -361,11 +368,6 @@ def _json_serialize(obj: object) -> str:
 
 # --- Shared streaming / message utilities ---
 
-# Fields added by reasoning models that should be stripped from SSE deltas
-# so downstream consumers (SkyrimNet) only see plain content.
-_REASONING_FIELDS = {"reasoning", "reasoning_content", "reasoning_details"}
-
-
 _CHAT_ALLOWED_EXTRA = {
     "temperature",
     "top_p",
@@ -378,83 +380,6 @@ _CHAT_ALLOWED_EXTRA = {
     "n",
     "reasoning",
 }
-
-
-def _model_uses_oai_messages(model: str) -> bool:
-    """Return True for providers that accept OpenAI-format chat messages directly."""
-    return (
-        is_ollama_model(model)
-        or is_openrouter_model(model)
-        or is_zai_model(model)
-        or is_xiaomi_model(model)
-        or is_opencode_model(model)
-        or is_qwen_model(model)
-        or is_fireworks_model(model)
-        or is_nvidia_model(model)
-    )
-
-
-async def passthrough_sse(resp, request_id: str, provider_name: str, start: float):
-    """Passthrough OpenAI-format SSE from an upstream response, yielding events.
-
-    Used by OpenRouter, Ollama, Z.AI, OpenCode, Qwen — all OpenAI-compatible SSE.
-    Strips reasoning fields (reasoning, reasoning_content, reasoning_details) from
-    SSE deltas so downstream consumers only see plain content.  Reasoning-only
-    chunks (content empty/null while reasoning present) are silently dropped.
-    """
-    buffer = bytearray()
-    total_content = 0
-
-    def _emit_event(event_bytes: bytes) -> tuple[Optional[str], int]:
-        if not event_bytes:
-            return None, 0
-
-        event = event_bytes.decode("utf-8", errors="replace").strip()
-        if not event:
-            return None, 0
-        if not event.startswith("data: ") or event.startswith("data: [DONE]"):
-            return event + "\n\n", 0
-
-        # Fast path: most chunks do not carry reasoning fields, so skip JSON
-        # parsing entirely unless the event looks like a reasoning chunk.
-        if b'"reasoning' not in event_bytes:
-            return event + "\n\n", 0
-
-        try:
-            data = json.loads(event[6:])
-            delta = data.get("choices", [{}])[0].get("delta", {})
-            content = delta.get("content")
-            modified = False
-            for rf in _REASONING_FIELDS:
-                if delta.pop(rf, None) is not None:
-                    modified = True
-            if content:
-                return (f"data: {json.dumps(data)}\n\n" if modified else event + "\n\n"), len(content)
-            if modified:
-                return None, 0
-            return event + "\n\n", 0
-        except (json.JSONDecodeError, KeyError, IndexError):
-            return event + "\n\n", 0
-
-    async for raw_chunk in resp.content.iter_any():
-        buffer.extend(raw_chunk)
-        while True:
-            idx = buffer.find(b"\n\n")
-            if idx < 0:
-                break
-            event_bytes = bytes(buffer[:idx]).strip()
-            del buffer[:idx + 2]
-            emitted, content_len = _emit_event(event_bytes)
-            total_content += content_len
-            if emitted is not None:
-                yield emitted
-    if buffer.strip():
-        emitted, content_len = _emit_event(bytes(buffer).strip())
-        total_content += content_len
-        if emitted is not None:
-            yield emitted
-    elapsed = time.time() - start
-    logger.info(f"[{request_id}] <- stream done ({elapsed:.1f}s, {provider_name}, {total_content} chars)")
 
 
 def _get_codex_command() -> tuple[str, list[str]]:
@@ -520,172 +445,6 @@ _ENCRYPTED_AUTH_FIELDS = {"refresh_token", "access_token"}
 #     ``IsADirectoryError``) — these are fatal configuration problems, never
 #     transient; retrying them only masks the root cause
 #   - any other exception type
-
-_DEFAULT_RETRY_STATUSES: frozenset = frozenset({429, 500, 502, 503, 504})
-_NO_RETRY_STATUSES: frozenset = frozenset({401, 403})
-
-
-async def _with_retry(
-    fn,
-    *,
-    operation: str,
-    request_id: str,
-    retry_on_status: frozenset = _DEFAULT_RETRY_STATUSES,
-    base_delay_s: float = 0.5,
-):
-    """Call ``fn()`` (async, zero-arg) up to ``max_retries + 1`` times.
-
-    Retries on:
-      - network exceptions: ``aiohttp.ClientConnectorError``,
-        ``aiohttp.ServerDisconnectedError``, ``asyncio.TimeoutError``,
-        ``ConnectionError`` (parent of ``ConnectionResetError``,
-        ``ConnectionAbortedError``, and ``BrokenPipeError``)
-      - ``HTTPException`` whose ``status_code`` is in ``retry_on_status``
-        (default: 429, 500, 502, 503, 504)
-
-    Does NOT retry:
-      - ``HTTPException`` with status_code in ``_NO_RETRY_STATUSES``
-        (401/403 — auth is broken, fail fast)
-      - any other 4xx
-      - **bare ``OSError``** is deliberately NOT retried — a
-        ``PermissionError`` or ``FileNotFoundError`` is always fatal
-        (misconfiguration, not a transient upstream hiccup) and retrying
-        them would just mask the root cause.  Only the network-flavoured
-        ``ConnectionError`` subfamily above is retried.
-      - any other exception type
-
-    Between attempts, sleeps ``base_delay_s * 2**attempt`` seconds (exponential
-    backoff, no jitter). On the final attempt the last exception is re-raised.
-
-    Note: the backoff schedule is computed from ``attempt`` alone (no wall-
-    clock arithmetic), so there is no need for ``time.monotonic()`` inside
-    this helper.  If future changes add elapsed-time accounting, prefer
-    ``time.monotonic()`` over ``time.time()`` so NTP adjustments can't cause
-    negative delays.
-    """
-    attempts = max_retries + 1
-    last_exc: Optional[BaseException] = None
-    for attempt in range(attempts):
-        try:
-            return await fn()
-        except HTTPException as e:
-            last_exc = e
-            if e.status_code in _NO_RETRY_STATUSES:
-                raise
-            if e.status_code not in retry_on_status:
-                raise
-            if attempt + 1 >= attempts:
-                raise
-            delay = base_delay_s * (2 ** attempt)
-            logger.warning(
-                f"[{request_id}] {operation} HTTP {e.status_code} — retry "
-                f"{attempt + 1}/{max_retries} in {delay:.1f}s"
-            )
-            await asyncio.sleep(delay)
-        except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError,
-                asyncio.TimeoutError, ConnectionError) as e:
-            # ConnectionError covers ConnectionResetError, ConnectionAbortedError,
-            # and BrokenPipeError — all genuine transport hiccups.  Note we do
-            # NOT catch bare OSError here (see docstring).
-            last_exc = e
-            if attempt + 1 >= attempts:
-                raise
-            delay = base_delay_s * (2 ** attempt)
-            logger.warning(
-                f"[{request_id}] {operation} {type(e).__name__} — retry "
-                f"{attempt + 1}/{max_retries} in {delay:.1f}s"
-            )
-            await asyncio.sleep(delay)
-    # Unreachable — loop either returns or raises. Keep type-checkers happy.
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError(f"{operation}: retry loop exited without result")
-
-
-async def _open_stream_with_retry(
-    session,
-    url: str,
-    *,
-    json_payload: dict,
-    headers: dict,
-    operation: str,
-    request_id: str,
-    retry_on_status: frozenset = _DEFAULT_RETRY_STATUSES,
-    base_delay_s: float = 0.5,
-    retry_connect_errors: bool = True,
-):
-    """Open a streaming POST, retrying only the pre-first-byte phase.
-
-    Returns a tuple ``(resp, resp_cm)`` of the live aiohttp response and its
-    context-manager handle — the caller is responsible for ``await
-    resp_cm.__aexit__(None, None, None)`` once the body has been consumed.
-
-    If every attempt fails with a retryable status / network error, the final
-    ``HTTPException`` (or network exception wrapped as HTTPException 502) is
-    raised so the caller can surface an SSE error chunk via
-    ``yield_sse_error``.  401/403 fail fast; 4xx other than 429 fails fast.
-
-    Pass ``retry_connect_errors=False`` to let ``aiohttp.ClientConnectorError``
-    propagate immediately (used by Ollama where a connect error means the
-    local daemon is down, not a transient failure).
-    """
-    attempts = max_retries + 1
-    for attempt in range(attempts):
-        try:
-            resp_cm = session.post(url, json=json_payload, headers=headers)
-            resp = await resp_cm.__aenter__()
-        except aiohttp.ClientConnectorError:
-            if not retry_connect_errors:
-                raise
-            if attempt + 1 >= attempts:
-                raise HTTPException(status_code=502, detail=f"{operation} connect error")
-            delay = base_delay_s * (2 ** attempt)
-            logger.warning(
-                f"[{request_id}] {operation} stream ClientConnectorError — retry "
-                f"{attempt + 1}/{max_retries} in {delay:.1f}s"
-            )
-            await asyncio.sleep(delay)
-            continue
-        except (aiohttp.ServerDisconnectedError, asyncio.TimeoutError,
-                ConnectionError) as e:
-            # Mirror _with_retry's narrowing: only genuine transport errors
-            # (ConnectionError = ConnectionResetError / ConnectionAbortedError
-            # / BrokenPipeError) are retried.  Bare OSError (e.g.
-            # PermissionError, FileNotFoundError) is fatal and must propagate.
-            if attempt + 1 >= attempts:
-                raise HTTPException(status_code=502, detail=f"{operation} network error: {type(e).__name__}")
-            delay = base_delay_s * (2 ** attempt)
-            logger.warning(
-                f"[{request_id}] {operation} stream {type(e).__name__} — retry "
-                f"{attempt + 1}/{max_retries} in {delay:.1f}s"
-            )
-            await asyncio.sleep(delay)
-            continue
-        if resp.status == 200:
-            return resp, resp_cm
-        # Non-200: classify and maybe retry
-        error_body = await resp.text()
-        status = resp.status
-        logger.error(f"[{request_id}] {operation} {status}: {error_body[:300]}")
-        try:
-            await resp_cm.__aexit__(None, None, None)
-        except Exception:
-            pass
-        if (
-            status in _NO_RETRY_STATUSES
-            or status not in retry_on_status
-            or attempt + 1 >= attempts
-        ):
-            raise HTTPException(status_code=status, detail=error_body[:200])
-        delay = base_delay_s * (2 ** attempt)
-        logger.warning(
-            f"[{request_id}] {operation} stream HTTP {status} — retry "
-            f"{attempt + 1}/{max_retries} in {delay:.1f}s"
-        )
-        await asyncio.sleep(delay)
-    # Unreachable
-    raise RuntimeError(f"{operation}: stream retry loop exited without result")
-
 
 # --- Auth cache + persistent session ---
 

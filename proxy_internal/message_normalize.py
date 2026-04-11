@@ -2,6 +2,17 @@
 
 from typing import Optional
 
+from proxy_internal.model_detect import (
+    is_ollama_model,
+    is_openrouter_model,
+    is_zai_model,
+    is_xiaomi_model,
+    is_opencode_model,
+    is_qwen_model,
+    is_fireworks_model,
+    is_nvidia_model,
+)
+
 # Fields that should never be retained from Claude CLI auth-capture templates.
 _CLAUDE_TEMPLATE_STRIPPED_FIELDS = {"tools", "thinking", "context_management", "tool_choice", "system"}
 
@@ -140,3 +151,17 @@ def _normalize_chat_messages(messages: list) -> tuple[Optional[str], list[dict],
         merged_messages.insert(0, {"role": "user", "content": "Continue."})
 
     return "\n\n".join(system_parts) or None, merged_messages, oai_messages
+
+
+def _model_uses_oai_messages(model: str) -> bool:
+    """Return True for providers that accept OpenAI-format chat messages directly."""
+    return (
+        is_ollama_model(model)
+        or is_openrouter_model(model)
+        or is_zai_model(model)
+        or is_xiaomi_model(model)
+        or is_opencode_model(model)
+        or is_qwen_model(model)
+        or is_fireworks_model(model)
+        or is_nvidia_model(model)
+    )
