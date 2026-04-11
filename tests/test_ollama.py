@@ -127,6 +127,125 @@ async def test_call_ollama_direct_cloud_endpoint_and_auth(proxy_module):
 
 
 @pytest.mark.asyncio
+async def test_call_ollama_direct_strips_unsupported_top_k(proxy_module):
+    """Ollama OpenAI-compat requests should not forward unsupported top_k."""
+    resp = _make_mock_response(200, {"choices": [{"message": {"content": "Cloud hi"}}]})
+    session = _make_mock_session(resp)
+
+    with patch.object(proxy_module, "ollama_api_key", "sk-ollama-test"), \
+         patch.object(proxy_module, "auth", MagicMock(session=None)), \
+         patch("aiohttp.ClientSession", return_value=session):
+        result = await proxy_module.call_ollama_direct(
+            None,
+            [{"role": "user", "content": "hi"}],
+            "ollama:llama3.2",
+            100,
+            temperature=0.2,
+            top_k=40,
+        )
+
+    assert result == "Cloud hi"
+    payload = session.post.call_args[1]["json"]
+    assert payload["temperature"] == 0.2
+    assert "top_k" not in payload
+
+
+@pytest.mark.asyncio
+async def test_call_ollama_direct_reasoning_only_response_raises_502(proxy_module):
+    """A reasoning-only Ollama response should not crash the proxy with KeyError."""
+    from fastapi import HTTPException
+
+    resp = _make_mock_response(
+        200,
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"reasoning": "internal trace"},
+            }]
+        },
+    )
+    session = _make_mock_session(resp)
+
+    with patch.object(proxy_module, "ollama_api_key", None), \
+         patch.object(proxy_module, "auth", MagicMock(session=None)), \
+         patch("aiohttp.ClientSession", return_value=session):
+        with pytest.raises(HTTPException) as exc:
+            await proxy_module.call_ollama_direct(
+                None, [{"role": "user", "content": "hi"}], "ollama:llama3.2", 100
+            )
+
+    assert exc.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_call_ollama_direct_retries_reasoning_truncation_without_max_tokens(proxy_module):
+    """A reasoning-truncated Ollama response should retry once without max_tokens."""
+    first_resp = _make_mock_response(
+        200,
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"reasoning_content": "internal trace"},
+            }]
+        },
+    )
+    second_resp = _make_mock_response(
+        200,
+        {"choices": [{"message": {"content": "final answer"}}]},
+    )
+    session = MagicMock()
+    session.post = MagicMock(side_effect=[first_resp, second_resp])
+    session.close = AsyncMock()
+
+    with patch.object(proxy_module, "ollama_api_key", None), \
+         patch.object(proxy_module, "auth", MagicMock(session=None)), \
+         patch("aiohttp.ClientSession", return_value=session):
+        result = await proxy_module.call_ollama_direct(
+            None, [{"role": "user", "content": "hi"}], "ollama:llama3.2", 100
+        )
+
+    assert result == "final answer"
+    first_payload = session.post.call_args_list[0].kwargs["json"]
+    second_payload = session.post.call_args_list[1].kwargs["json"]
+    assert first_payload["max_tokens"] == 100
+    assert "max_tokens" not in second_payload
+
+
+@pytest.mark.asyncio
+async def test_call_ollama_direct_retries_reasoning_only_stop_without_max_tokens(proxy_module):
+    """Some Ollama reasoning responses stop without content; retry once without max_tokens."""
+    first_resp = _make_mock_response(
+        200,
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"reasoning_content": "internal trace"},
+            }]
+        },
+    )
+    second_resp = _make_mock_response(
+        200,
+        {"choices": [{"message": {"content": "final answer"}}]},
+    )
+    session = MagicMock()
+    session.post = MagicMock(side_effect=[first_resp, second_resp])
+    session.close = AsyncMock()
+
+    with patch.object(proxy_module, "ollama_api_key", None), \
+         patch.object(proxy_module, "auth", MagicMock(session=None)), \
+         patch("aiohttp.ClientSession", return_value=session):
+        result = await proxy_module.call_ollama_direct(
+            None, [{"role": "user", "content": "hi"}], "ollama:llama3.2", 100
+        )
+
+    assert result == "final answer"
+    first_payload = session.post.call_args_list[0].kwargs["json"]
+    second_payload = session.post.call_args_list[1].kwargs["json"]
+    assert first_payload["max_tokens"] == 100
+    assert "max_tokens" not in second_payload
+
+
+@pytest.mark.asyncio
 async def test_call_ollama_direct_unreachable_raises_503(proxy_module):
     """ClientConnectorError -> HTTPException 503."""
     import aiohttp
@@ -188,6 +307,45 @@ async def test_call_ollama_streaming_passthrough(proxy_module):
 
     combined = "".join(chunks)
     assert "hello" in combined
+
+
+@pytest.mark.asyncio
+async def test_call_ollama_streaming_strips_unsupported_top_k(proxy_module):
+    """Streaming requests should also drop unsupported top_k for Ollama."""
+    sse_bytes = b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\ndata: [DONE]\n\n'
+
+    mock_content = MagicMock()
+    mock_content.iter_any.return_value = _async_bytes_iter([sse_bytes])
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.content = mock_content
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    session = MagicMock()
+    session.post = MagicMock(return_value=mock_resp)
+    session.close = AsyncMock()
+
+    with patch.object(proxy_module, "ollama_api_key", "sk-ollama-test"), \
+         patch.object(proxy_module, "auth", MagicMock(session=None)), \
+         patch("aiohttp.ClientSession", return_value=session):
+        chunks = []
+        async for chunk in proxy_module.call_ollama_streaming(
+            None,
+            [{"role": "user", "content": "hi"}],
+            "ollama:llama3.2",
+            100,
+            reasoning={"effort": "low"},
+            top_k=20,
+        ):
+            chunks.append(chunk)
+
+    combined = "".join(chunks)
+    payload = session.post.call_args[1]["json"]
+    assert "hello" in combined
+    assert payload["reasoning"] == {"effort": "low"}
+    assert "top_k" not in payload
 
 
 @pytest.mark.asyncio

@@ -62,6 +62,8 @@ The proxy will:
 3. Load Codex auth from `~/.codex/auth.json` (if available)
 4. Start the API server on `http://127.0.0.1:8000`
 
+> Note: MCP mode uses port 9997 for the interceptor, allowing both modes to run simultaneously.
+
 ### Dashboard
 
 Open `http://127.0.0.1:8000` in a browser to see the status dashboard with a quick test form.
@@ -70,7 +72,7 @@ Open `http://127.0.0.1:8000` in a browser to see the status dashboard with a qui
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/chat/completions` | POST | OpenAI-compatible chat completions (streaming + non-streaming) |
+| `/v1/chat/completions` | POST | OpenAI-compatible chat completions (streaming + non-streaming), preserving caller-supplied `system` messages |
 | `/v1/models` | GET | List available models |
 | `/config/openrouter-key` | POST | Set OpenRouter API key (JSON body: `{"key": "sk-or-..."}`) |
 | `/health` | GET | Health check |
@@ -109,7 +111,7 @@ To use Codex models:
 3. Restart the proxy
 4. Use any model starting with `gpt-5.` or `codex-`
 
-Codex models spawn a subprocess per request (unlike Claude's direct API calls), so expect slightly higher latency.
+Codex models spawn a subprocess per request (unlike Claude's direct API calls), but the proxy forces Codex into fast mode with `model_reasoning_effort="low"`. That trades roughly 2x credit burn for lower latency, and keeps the direct and streaming Codex paths aligned.
 
 ### Ollama Support
 
@@ -124,6 +126,8 @@ To use Ollama Cloud:
 1. Open the dashboard at `http://127.0.0.1:8000` and enter your Ollama Cloud API key in the Ollama section
 2. Use the same `ollama:model-name` prefix — the proxy routes to cloud automatically when the key is set
 3. Clear the key to switch back to local
+
+Ollama note: the proxy drops `top_k` for Ollama requests because Ollama's OpenAI-compatible `/v1/chat/completions` API does not support that field. The direct Ollama path also now treats reasoning-only or missing-`content` responses as upstream contract issues instead of crashing the proxy with a 500, and retries once without `max_tokens` when Ollama reports reasoning truncation.
 
 ### OpenRouter Support
 
@@ -169,7 +173,7 @@ Each request cycles to the next model in the list. Models are routed based on na
 ### "Auth not ready" / Startup fails
 - Ensure `claude` CLI is on your PATH: `claude --version`
 - Ensure you're logged in: `claude` (should start without auth errors)
-- Check that port 9999 is not in use
+- Check that port 9999 (proxy mode) or 9997 (MCP mode) is not in use
 
 ### "Codex auth not ready"
 - Ensure `codex` CLI is on your PATH: `codex --version`
