@@ -189,9 +189,9 @@ async def call_nvidia_direct(system_prompt: Optional[str], messages: list, model
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
-    try:
+
+    async def _do_call() -> str:
         async with session.post(endpoint, json=payload, headers=headers) as resp:
-            elapsed = time.time() - start
             if resp.status in (401, 403):
                 raise HTTPException(status_code=401, detail="NVIDIA NIM auth failed — check API key")
             if resp.status == 429:
@@ -209,10 +209,16 @@ async def call_nvidia_direct(system_prompt: Optional[str], messages: list, model
             if content is None:
                 logger.warning(f"[{request_id}] NVIDIA NIM returned null content, full response: {str(data)[:500]}")
                 raise HTTPException(status_code=500, detail="NVIDIA NIM returned empty content")
-            logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, NVIDIA NIM)")
             return content
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="NVIDIA NIM request timed out")
+
+    try:
+        try:
+            content = await _with_retry(_do_call, operation=f"NVIDIA NIM {api_model}", request_id=request_id)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="NVIDIA NIM request timed out")
+        elapsed = time.time() - start
+        logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, NVIDIA NIM)")
+        return content
     finally:
         if owns_session:
             await session.close()
@@ -238,15 +244,20 @@ async def call_nvidia_streaming(system_prompt: Optional[str], messages: list, mo
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
+    resp_cm = None
     try:
-        async with session.post(endpoint, json=payload, headers=headers) as resp:
-            if resp.status != 200:
-                error_body = await resp.text()
-                logger.error(f"[{request_id}] NVIDIA NIM {resp.status}: {error_body[:300]}")
-                err, done = yield_sse_error(model, f"[NVIDIA NIM Error {resp.status}]")
-                yield err; yield done
-                return
+        try:
+            resp, resp_cm = await _open_stream_with_retry(
+                session, endpoint,
+                json_payload=payload, headers=headers,
+                operation="NVIDIA NIM", request_id=request_id,
+            )
+        except HTTPException as e:
+            err, done = yield_sse_error(model, f"[NVIDIA NIM Error {e.status_code}]")
+            yield err; yield done
+            return
 
+        try:
             saw_done = False
             async for event in passthrough_sse(resp, request_id, "NVIDIA NIM", start):
                 if event.strip().startswith("data: [DONE]"):
@@ -255,12 +266,16 @@ async def call_nvidia_streaming(system_prompt: Optional[str], messages: list, mo
 
             if not saw_done:
                 yield "data: [DONE]\n\n"
-            return
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        logger.error(f"[{request_id}] NVIDIA NIM streaming error: {e}")
-        err, done = yield_sse_error(model, f"[NVIDIA NIM Error: {e}]")
-        yield err; yield done
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.error(f"[{request_id}] NVIDIA NIM streaming error: {e}")
+            err, done = yield_sse_error(model, f"[NVIDIA NIM Error: {e}]")
+            yield err; yield done
     finally:
+        if resp_cm is not None:
+            try:
+                await resp_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
         if owns_session:
             await session.close()
 
@@ -655,6 +670,203 @@ def _save_config(data: dict) -> None:
         except OSError:
             pass  # fsync unsupported on some filesystems — best effort
     os.replace(tmp_path, CONFIG_FILE)
+
+
+# --- Retry policy ---
+#
+# One uniform retry policy, tunable at runtime via the dashboard.
+# ``max_retries`` is the number of retry attempts AFTER the first try, so the
+# total call count is ``max_retries + 1``. Default 1 (one try, one retry on
+# failure).
+#
+# Scope of ``_with_retry``: wrap the network POST + status-validation step of
+# every OpenAI-compatible upstream (OpenRouter, Ollama, Z.AI, Xiaomi,
+# OpenCode, Qwen, Fireworks, NVIDIA NIM). For streaming providers we only
+# retry the pre-first-byte phase — once upstream bytes are flowing we cannot
+# cleanly resume, and a mid-stream error is surfaced as an SSE error chunk via
+# the existing ``yield_sse_error`` helper.
+#
+# NOT wrapped (intentional exclusions):
+#   - ``call_api_*`` (Claude native) — MITM auth layer handles its own
+#     recapture/retries on auth failures.
+#   - ``call_codex_*`` — spawns the Codex CLI subprocess; retry semantics are
+#     owned by the CLI.
+#   - ``call_gemini_*`` — mix of Gemini CLI subprocess + direct Google API
+#     calls with provider-specific fallbacks.
+#   - ``call_antigravity_*`` — already has multi-account OAuth fallback.
+#
+# Retried on:
+#   - network exceptions (``aiohttp.ClientConnectorError``,
+#     ``aiohttp.ServerDisconnectedError``, ``asyncio.TimeoutError``,
+#     ``OSError``)
+#   - ``HTTPException`` whose ``status_code`` is in ``_DEFAULT_RETRY_STATUSES``
+#     (429, 500, 502, 503, 504)
+#
+# NOT retried on:
+#   - 401/403 (auth broken — fail fast)
+#   - other 4xx
+#   - any other exception type
+
+_DEFAULT_RETRY_STATUSES: frozenset = frozenset({429, 500, 502, 503, 504})
+_NO_RETRY_STATUSES: frozenset = frozenset({401, 403})
+
+
+def _load_max_retries(cfg: Optional[dict] = None) -> int:
+    """Clamp max_retries from config into the legal 0..10 range.
+
+    Accepts either an already-loaded config dict or ``None`` to re-read from
+    disk.  Default is 1 (one try, one retry).
+    """
+    if cfg is None:
+        cfg = _load_config()
+    raw = cfg.get("max_retries", 1)
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 1
+    return max(0, min(10, n))
+
+
+async def _with_retry(
+    fn,
+    *,
+    operation: str,
+    request_id: str,
+    retry_on_status: frozenset = _DEFAULT_RETRY_STATUSES,
+    base_delay_s: float = 0.5,
+):
+    """Call ``fn()`` (async, zero-arg) up to ``max_retries + 1`` times.
+
+    Retries on:
+      - network exceptions (``aiohttp.ClientConnectorError``,
+        ``aiohttp.ServerDisconnectedError``, ``asyncio.TimeoutError``,
+        ``OSError``)
+      - ``HTTPException`` whose ``status_code`` is in ``retry_on_status``
+        (default: 429, 500, 502, 503, 504)
+
+    Does NOT retry:
+      - ``HTTPException`` with status_code in ``_NO_RETRY_STATUSES``
+        (401/403 — auth is broken, fail fast)
+      - any other 4xx
+      - any other exception type
+
+    Between attempts, sleeps ``base_delay_s * 2**attempt`` seconds (exponential
+    backoff, no jitter). On the final attempt the last exception is re-raised.
+    """
+    attempts = max_retries + 1
+    last_exc: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            return await fn()
+        except HTTPException as e:
+            last_exc = e
+            if e.status_code in _NO_RETRY_STATUSES:
+                raise
+            if e.status_code not in retry_on_status:
+                raise
+            if attempt + 1 >= attempts:
+                raise
+            delay = base_delay_s * (2 ** attempt)
+            logger.warning(
+                f"[{request_id}] {operation} HTTP {e.status_code} — retry "
+                f"{attempt + 1}/{max_retries} in {delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+        except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError,
+                asyncio.TimeoutError, OSError) as e:
+            last_exc = e
+            if attempt + 1 >= attempts:
+                raise
+            delay = base_delay_s * (2 ** attempt)
+            logger.warning(
+                f"[{request_id}] {operation} {type(e).__name__} — retry "
+                f"{attempt + 1}/{max_retries} in {delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+    # Unreachable — loop either returns or raises. Keep type-checkers happy.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{operation}: retry loop exited without result")
+
+
+async def _open_stream_with_retry(
+    session,
+    url: str,
+    *,
+    json_payload: dict,
+    headers: dict,
+    operation: str,
+    request_id: str,
+    retry_on_status: frozenset = _DEFAULT_RETRY_STATUSES,
+    base_delay_s: float = 0.5,
+    retry_connect_errors: bool = True,
+):
+    """Open a streaming POST, retrying only the pre-first-byte phase.
+
+    Returns a tuple ``(resp, resp_cm)`` of the live aiohttp response and its
+    context-manager handle — the caller is responsible for ``await
+    resp_cm.__aexit__(None, None, None)`` once the body has been consumed.
+
+    If every attempt fails with a retryable status / network error, the final
+    ``HTTPException`` (or network exception wrapped as HTTPException 502) is
+    raised so the caller can surface an SSE error chunk via
+    ``yield_sse_error``.  401/403 fail fast; 4xx other than 429 fails fast.
+
+    Pass ``retry_connect_errors=False`` to let ``aiohttp.ClientConnectorError``
+    propagate immediately (used by Ollama where a connect error means the
+    local daemon is down, not a transient failure).
+    """
+    attempts = max_retries + 1
+    for attempt in range(attempts):
+        try:
+            resp_cm = session.post(url, json=json_payload, headers=headers)
+            resp = await resp_cm.__aenter__()
+        except aiohttp.ClientConnectorError:
+            if not retry_connect_errors:
+                raise
+            if attempt + 1 >= attempts:
+                raise HTTPException(status_code=502, detail=f"{operation} connect error")
+            delay = base_delay_s * (2 ** attempt)
+            logger.warning(
+                f"[{request_id}] {operation} stream ClientConnectorError — retry "
+                f"{attempt + 1}/{max_retries} in {delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+            continue
+        except (aiohttp.ServerDisconnectedError, asyncio.TimeoutError, OSError) as e:
+            if attempt + 1 >= attempts:
+                raise HTTPException(status_code=502, detail=f"{operation} network error: {type(e).__name__}")
+            delay = base_delay_s * (2 ** attempt)
+            logger.warning(
+                f"[{request_id}] {operation} stream {type(e).__name__} — retry "
+                f"{attempt + 1}/{max_retries} in {delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+            continue
+        if resp.status == 200:
+            return resp, resp_cm
+        # Non-200: classify and maybe retry
+        error_body = await resp.text()
+        status = resp.status
+        logger.error(f"[{request_id}] {operation} {status}: {error_body[:300]}")
+        try:
+            await resp_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+        if (
+            status in _NO_RETRY_STATUSES
+            or status not in retry_on_status
+            or attempt + 1 >= attempts
+        ):
+            raise HTTPException(status_code=status, detail=error_body[:200])
+        delay = base_delay_s * (2 ** attempt)
+        logger.warning(
+            f"[{request_id}] {operation} stream HTTP {status} — retry "
+            f"{attempt + 1}/{max_retries} in {delay:.1f}s"
+        )
+        await asyncio.sleep(delay)
+    # Unreachable
+    raise RuntimeError(f"{operation}: stream retry loop exited without result")
 
 
 # --- Auth cache + persistent session ---
@@ -1267,7 +1479,9 @@ if nvidia_api_key:
 timeout_routing_enabled: bool = _cfg.get("timeout_routing_enabled", True)
 timeout_cutoff_seconds: float = _cfg.get("timeout_cutoff_seconds", 6.0)
 max_total_seconds: float = _cfg.get("max_total_seconds", 9.0)
+max_retries: int = _load_max_retries(_cfg)
 logger.info(f"Timeout routing: {'enabled' if timeout_routing_enabled else 'disabled'} (TTFT cutoff {timeout_cutoff_seconds}s, max total {max_total_seconds}s)")
+logger.info(f"Retry policy: max_retries={max_retries}")
 _round_robin_counter: int = 0
 
 
@@ -2383,7 +2597,7 @@ def _build_api_body(system_prompt: Optional[str], messages: list, model: str) ->
 
 async def call_api_direct(system_prompt: Optional[str], messages: list, model: str, max_tokens: int) -> str:
     """Direct API call, collects full response (non-streaming to caller)."""
-
+    # Retry policy: not wrapped — see _with_retry docstring.
     body = _build_api_body(system_prompt, messages, model)
     headers = dict(auth.headers)
     body_bytes = json_dumps(body)
@@ -2464,7 +2678,7 @@ async def call_api_direct(system_prompt: Optional[str], messages: list, model: s
 
 async def call_api_streaming(system_prompt: Optional[str], messages: list, model: str, max_tokens: int):
     """Direct API call, yields OpenAI-format SSE chunks as they arrive."""
-
+    # Retry policy: not wrapped — see _with_retry docstring.
     body = _build_api_body(system_prompt, messages, model)
     headers = dict(auth.headers)
     body_bytes = json_dumps(body)
@@ -2677,6 +2891,7 @@ async def call_codex_direct(
     max_tokens: int,
 ) -> str:
     """Spawn Codex CLI subprocess with isolated HOME (clean config, no global instructions)."""
+    # Retry policy: not wrapped — see _with_retry docstring.
     if not CODEX_PATH:
         raise HTTPException(status_code=503, detail="Codex CLI not installed")
 
@@ -2770,6 +2985,7 @@ async def call_codex_streaming(
     max_tokens: int,
 ):
     """Spawn Codex CLI subprocess with isolated HOME and yield output as SSE stream."""
+    # Retry policy: not wrapped — see _with_retry docstring.
     if not CODEX_PATH:
         yield 'data: {"error": "Codex CLI not installed"}\n\n'
         yield "data: [DONE]\n\n"
@@ -2926,12 +3142,12 @@ async def call_openrouter_direct(system_prompt: Optional[str], messages: list, m
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
-    try:
+
+    async def _do_call() -> str:
         async with session.post(
             "https://openrouter.ai/api/v1/chat/completions",
             json=payload, headers=headers,
         ) as resp:
-            elapsed = time.time() - start
             if resp.status != 200:
                 error_body = await resp.text()
                 logger.error(f"[{request_id}] OpenRouter {resp.status}: {error_body[:300]}")
@@ -2943,15 +3159,29 @@ async def call_openrouter_direct(system_prompt: Optional[str], messages: list, m
             text = (choices[0].get("message") or {}).get("content")
             if text is None:
                 raise HTTPException(status_code=502, detail="OpenRouter returned no content")
-            logger.info(f"[{request_id}] <- {len(text)} chars ({elapsed:.1f}s, OpenRouter)")
             return text
+
+    try:
+        text = await _with_retry(
+            _do_call,
+            operation=f"OpenRouter {model}",
+            request_id=request_id,
+        )
+        elapsed = time.time() - start
+        logger.info(f"[{request_id}] <- {len(text)} chars ({elapsed:.1f}s, OpenRouter)")
+        return text
     finally:
         if owns_session:
             await session.close()
 
 
 async def call_openrouter_streaming(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params):
-    """Forward request to OpenRouter with streaming, passthrough SSE directly."""
+    """Forward request to OpenRouter with streaming, passthrough SSE directly.
+
+    Retry policy: the pre-first-byte phase (connect + status check) is retried
+    via ``_open_stream_with_retry``.  Once bytes are flowing we cannot cleanly
+    resume — mid-stream errors are surfaced as SSE error chunks.
+    """
     if not openrouter_api_key:
         yield 'data: {"error": "OpenRouter API key not configured"}\n\n'
         yield "data: [DONE]\n\n"
@@ -2967,26 +3197,36 @@ async def call_openrouter_streaming(system_prompt: Optional[str], messages: list
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
+    resp_cm = None
     try:
-        async with session.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            json=payload, headers=headers,
-        ) as resp:
-            if resp.status != 200:
-                error_body = await resp.text()
-                logger.error(f"[{request_id}] OpenRouter {resp.status}: {error_body[:300]}")
-                err, done = yield_sse_error(model, f"[OpenRouter Error {resp.status}]")
-                yield err; yield done
-                return
+        try:
+            resp, resp_cm = await _open_stream_with_retry(
+                session,
+                "https://openrouter.ai/api/v1/chat/completions",
+                json_payload=payload,
+                headers=headers,
+                operation="OpenRouter",
+                request_id=request_id,
+            )
+        except HTTPException as e:
+            err, done = yield_sse_error(model, f"[OpenRouter Error {e.status_code}]")
+            yield err; yield done
+            return
 
+        try:
             # OpenRouter returns OpenAI-format SSE — passthrough directly
             async for event in passthrough_sse(resp, request_id, "OpenRouter", start):
                 yield event
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        logger.error(f"[{request_id}] OpenRouter streaming error: {e}")
-        err, done = yield_sse_error(model, f"[OpenRouter Error: {e}]")
-        yield err; yield done
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.error(f"[{request_id}] OpenRouter streaming error: {e}")
+            err, done = yield_sse_error(model, f"[OpenRouter Error: {e}]")
+            yield err; yield done
     finally:
+        if resp_cm is not None:
+            try:
+                await resp_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
         if owns_session:
             await session.close()
 
@@ -3024,11 +3264,12 @@ async def call_ollama_direct(system_prompt: Optional[str], messages: list, model
 
     session = ollama_session or auth.session or create_session()
     owns_session = not ollama_session and not auth.session
-    last_error = None
-    try:
-        for attempt in range(3):
+
+    async def _do_call() -> str:
+        # ClientConnectorError means the local Ollama daemon is down — short
+        # circuit so _with_retry doesn't waste attempts on a dead socket.
+        try:
             async with session.post(endpoint, json=payload, headers=headers) as resp:
-                elapsed = time.time() - start
                 if resp.status in (401, 403):
                     raise HTTPException(status_code=401, detail="Ollama Cloud auth failed — check API key")
                 if resp.status == 429:
@@ -3036,12 +3277,6 @@ async def call_ollama_direct(system_prompt: Optional[str], messages: list, model
                 if resp.status != 200:
                     error_body = await resp.text()
                     logger.error(f"[{request_id}] Ollama {resp.status}: {error_body[:300]}")
-                    if resp.status >= 500 and attempt < 2:
-                        logger.info(f"[{request_id}] Retrying Ollama after {resp.status} (attempt {attempt + 1}/3)")
-                        last_error = HTTPException(status_code=resp.status, detail=error_body[:200])
-                        await asyncio.sleep(2 ** attempt)
-                        start = time.time()
-                        continue
                     raise HTTPException(status_code=resp.status, detail=error_body[:200])
                 data = await resp.json()
                 text = _extract_oai_content(data["choices"][0]["message"])
@@ -3060,20 +3295,32 @@ async def call_ollama_direct(system_prompt: Optional[str], messages: list, model
                         text = _extract_oai_content(retry_data["choices"][0]["message"])
                 if text is None:
                     raise HTTPException(status_code=502, detail="Ollama returned no content")
-                logger.info(f"[{request_id}] <- {len(text)} chars ({elapsed:.1f}s, Ollama)")
                 return text
-        raise last_error
-    except aiohttp.ClientConnectorError:
-        raise HTTPException(status_code=503, detail="Ollama not running at localhost:11434")
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Ollama request timed out")
+        except aiohttp.ClientConnectorError:
+            # Local daemon down — not transient, surface immediately without retry.
+            raise HTTPException(status_code=503, detail="Ollama not running at localhost:11434")
+
+    try:
+        text = await _with_retry(
+            _do_call,
+            operation=f"Ollama {api_model}",
+            request_id=request_id,
+        )
+        elapsed = time.time() - start
+        logger.info(f"[{request_id}] <- {len(text)} chars ({elapsed:.1f}s, Ollama)")
+        return text
     finally:
         if owns_session:
             await session.close()
 
 
 async def call_ollama_streaming(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params):
-    """Forward request to Ollama with streaming, passthrough SSE directly."""
+    """Forward request to Ollama with streaming, passthrough SSE directly.
+
+    Retry policy: pre-first-byte retries via ``_open_stream_with_retry``.  A
+    ``ClientConnectorError`` (local daemon down) is NOT retried — surfaced as
+    an SSE error chunk immediately.
+    """
     api_model = model[len("ollama:"):]
     if ollama_api_key:
         endpoint = "https://ollama.com/v1/chat/completions"
@@ -3092,33 +3339,41 @@ async def call_ollama_streaming(system_prompt: Optional[str], messages: list, mo
 
     session = ollama_session or auth.session or create_session()
     owns_session = not ollama_session and not auth.session
+    resp_cm = None
     try:
-        for attempt in range(3):
-            async with session.post(endpoint, json=payload, headers=headers) as resp:
-                if resp.status != 200:
-                    error_body = await resp.text()
-                    logger.error(f"[{request_id}] Ollama {resp.status}: {error_body[:300]}")
-                    if resp.status >= 500 and attempt < 2:
-                        logger.info(f"[{request_id}] Retrying Ollama after {resp.status} (attempt {attempt + 1}/3, stream)")
-                        await asyncio.sleep(2 ** attempt)
-                        start = time.time()
-                        continue
-                    err, done = yield_sse_error(model, f"[Ollama Error {resp.status}]")
-                    yield err; yield done
-                    return
+        try:
+            resp, resp_cm = await _open_stream_with_retry(
+                session,
+                endpoint,
+                json_payload=payload,
+                headers=headers,
+                operation="Ollama",
+                request_id=request_id,
+                retry_connect_errors=False,
+            )
+        except aiohttp.ClientConnectorError:
+            err, done = yield_sse_error(model, "[Ollama Error: not running at localhost:11434]")
+            yield err; yield done
+            return
+        except HTTPException as e:
+            err, done = yield_sse_error(model, f"[Ollama Error {e.status_code}]")
+            yield err; yield done
+            return
 
-                # Ollama /v1 returns OpenAI-format SSE — passthrough directly
-                async for event in passthrough_sse(resp, request_id, "Ollama", start):
-                    yield event
-                return
-    except aiohttp.ClientConnectorError:
-        err, done = yield_sse_error(model, "[Ollama Error: not running at localhost:11434]")
-        yield err; yield done
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        logger.error(f"[{request_id}] Ollama streaming error: {e}")
-        err, done = yield_sse_error(model, f"[Ollama Error: {e}]")
-        yield err; yield done
+        try:
+            # Ollama /v1 returns OpenAI-format SSE — passthrough directly
+            async for event in passthrough_sse(resp, request_id, "Ollama", start):
+                yield event
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.error(f"[{request_id}] Ollama streaming error: {e}")
+            err, done = yield_sse_error(model, f"[Ollama Error: {e}]")
+            yield err; yield done
     finally:
+        if resp_cm is not None:
+            try:
+                await resp_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
         if owns_session:
             await session.close()
 
@@ -3159,9 +3414,9 @@ async def call_zai_direct(system_prompt: Optional[str], messages: list, model: s
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
-    try:
+
+    async def _do_call() -> str:
         async with session.post(endpoint, json=payload, headers=headers) as resp:
-            elapsed = time.time() - start
             if resp.status in (401, 403):
                 raise HTTPException(status_code=401, detail="Z.AI auth failed — check API key")
             if resp.status == 429:
@@ -3187,14 +3442,19 @@ async def call_zai_direct(system_prompt: Optional[str], messages: list, model: s
                             retry_data = await retry_resp.json()
                             content = _extract_oai_content(retry_data.get("choices", [{}])[0].get("message", {}))
                             if content:
-                                logger.info(f"[{request_id}] <- {len(content)} chars ({time.time() - start:.1f}s, Z.AI, retry)")
                                 return content
                 logger.warning(f"[{request_id}] Z.AI returned null content, full response: {str(data)[:500]}")
                 raise HTTPException(status_code=500, detail="Z.AI returned empty content")
-            logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, Z.AI)")
             return content
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Z.AI request timed out")
+
+    try:
+        try:
+            content = await _with_retry(_do_call, operation=f"Z.AI {api_model}", request_id=request_id)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Z.AI request timed out")
+        elapsed = time.time() - start
+        logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, Z.AI)")
+        return content
     finally:
         if owns_session:
             await session.close()
@@ -3224,15 +3484,22 @@ async def call_zai_streaming(system_prompt: Optional[str], messages: list, model
     owns_session = session is not third_party_session and session is not auth.session
     try:
         # Z.AI sometimes returns a 200 with an empty streaming body; retry a couple times.
+        # (This outer loop is the empty-body semantic retry.  Network-level
+        # retries on the initial POST are handled per-attempt by
+        # _open_stream_with_retry below.)
         for attempt in range(3):
-            async with session.post(endpoint, json=payload, headers=headers) as resp:
-                if resp.status != 200:
-                    error_body = await resp.text()
-                    logger.error(f"[{request_id}] Z.AI {resp.status}: {error_body[:300]}")
-                    err, done = yield_sse_error(model, f"[Z.AI Error {resp.status}]")
-                    yield err; yield done
-                    return
-
+            resp_cm = None
+            try:
+                resp, resp_cm = await _open_stream_with_retry(
+                    session, endpoint,
+                    json_payload=payload, headers=headers,
+                    operation="Z.AI", request_id=request_id,
+                )
+            except HTTPException as e:
+                err, done = yield_sse_error(model, f"[Z.AI Error {e.status_code}]")
+                yield err; yield done
+                return
+            try:
                 headers_obj = getattr(resp, "headers", None)
                 content_type_val = ""
                 if headers_obj is not None:
@@ -3319,6 +3586,13 @@ async def call_zai_streaming(system_prompt: Optional[str], messages: list, model
                 if not saw_done:
                     yield "data: [DONE]\n\n"
                 return
+            finally:
+                if resp_cm is not None:
+                    try:
+                        await resp_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    resp_cm = None
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         logger.error(f"[{request_id}] Z.AI streaming error: {e}")
         err, done = yield_sse_error(model, f"[Z.AI Error: {e}]")
@@ -3354,9 +3628,9 @@ async def call_xiaomi_direct(system_prompt: Optional[str], messages: list, model
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
-    try:
+
+    async def _do_call() -> str:
         async with session.post(endpoint, json=payload, headers=headers) as resp:
-            elapsed = time.time() - start
             if resp.status in (401, 403):
                 raise HTTPException(status_code=401, detail="Xiaomi auth failed — check API key")
             if resp.status == 429:
@@ -3382,14 +3656,19 @@ async def call_xiaomi_direct(system_prompt: Optional[str], messages: list, model
                             retry_data = await retry_resp.json()
                             content = _extract_oai_content(retry_data.get("choices", [{}])[0].get("message", {}))
                             if content:
-                                logger.info(f"[{request_id}] <- {len(content)} chars ({time.time() - start:.1f}s, Xiaomi, retry)")
                                 return content
                 logger.warning(f"[{request_id}] Xiaomi returned null content, full response: {str(data)[:500]}")
                 raise HTTPException(status_code=500, detail="Xiaomi returned empty content")
-            logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, Xiaomi)")
             return content
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Xiaomi request timed out")
+
+    try:
+        try:
+            content = await _with_retry(_do_call, operation=f"Xiaomi {api_model}", request_id=request_id)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Xiaomi request timed out")
+        elapsed = time.time() - start
+        logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, Xiaomi)")
+        return content
     finally:
         if owns_session:
             await session.close()
@@ -3418,23 +3697,33 @@ async def call_xiaomi_streaming(system_prompt: Optional[str], messages: list, mo
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
+    resp_cm = None
     try:
-        async with session.post(endpoint, json=payload, headers=headers) as resp:
-            if resp.status != 200:
-                error_body = await resp.text()
-                logger.error(f"[{request_id}] Xiaomi {resp.status}: {error_body[:300]}")
-                err, done = yield_sse_error(model, f"[Xiaomi Error {resp.status}]")
-                yield err; yield done
-                return
+        try:
+            resp, resp_cm = await _open_stream_with_retry(
+                session, endpoint,
+                json_payload=payload, headers=headers,
+                operation="Xiaomi", request_id=request_id,
+            )
+        except HTTPException as e:
+            err, done = yield_sse_error(model, f"[Xiaomi Error {e.status_code}]")
+            yield err; yield done
+            return
 
+        try:
             async for event in passthrough_sse(resp, request_id, "Xiaomi", start):
                 yield event
             yield "data: [DONE]\n\n"
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        logger.error(f"[{request_id}] Xiaomi streaming error: {e}")
-        err, done = yield_sse_error(model, f"[Xiaomi Error: {e}]")
-        yield err; yield done
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.error(f"[{request_id}] Xiaomi streaming error: {e}")
+            err, done = yield_sse_error(model, f"[Xiaomi Error: {e}]")
+            yield err; yield done
     finally:
+        if resp_cm is not None:
+            try:
+                await resp_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
         if owns_session:
             await session.close()
 
@@ -3470,9 +3759,9 @@ async def call_opencode_direct(system_prompt: Optional[str], messages: list, mod
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
-    try:
+
+    async def _do_call() -> str:
         async with session.post(endpoint, json=payload, headers=headers) as resp:
-            elapsed = time.time() - start
             if resp.status in (401, 403):
                 raise HTTPException(status_code=401, detail="OpenCode auth failed — check API key")
             if resp.status == 429:
@@ -3496,13 +3785,18 @@ async def call_opencode_direct(system_prompt: Optional[str], messages: list, mod
                             retry_data = await retry_resp.json()
                             content = _extract_oai_content(retry_data.get("choices", [{}])[0].get("message", {}))
                             if content:
-                                logger.info(f"[{request_id}] <- {len(content)} chars ({time.time() - start:.1f}s, OpenCode, retry)")
                                 return content
                 raise HTTPException(status_code=500, detail="OpenCode returned empty content")
-            logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, OpenCode)")
             return content
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="OpenCode request timed out")
+
+    try:
+        try:
+            content = await _with_retry(_do_call, operation=f"OpenCode {api_model}", request_id=request_id)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="OpenCode request timed out")
+        elapsed = time.time() - start
+        logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, OpenCode)")
+        return content
     finally:
         if owns_session:
             await session.close()
@@ -3529,23 +3823,33 @@ async def call_opencode_streaming(system_prompt: Optional[str], messages: list, 
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
+    resp_cm = None
     try:
-        async with session.post(endpoint, json=payload, headers=headers) as resp:
-            if resp.status != 200:
-                error_body = await resp.text()
-                logger.error(f"[{request_id}] OpenCode {resp.status}: {error_body[:300]}")
-                err, done = yield_sse_error(model, f"[OpenCode Error {resp.status}]")
-                yield err; yield done
-                return
+        try:
+            resp, resp_cm = await _open_stream_with_retry(
+                session, endpoint,
+                json_payload=payload, headers=headers,
+                operation="OpenCode", request_id=request_id,
+            )
+        except HTTPException as e:
+            err, done = yield_sse_error(model, f"[OpenCode Error {e.status_code}]")
+            yield err; yield done
+            return
 
+        try:
             async for event in passthrough_sse(resp, request_id, "OpenCode", start):
                 yield event
             yield "data: [DONE]\n\n"
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        logger.error(f"[{request_id}] OpenCode streaming error: {e}")
-        err, done = yield_sse_error(model, f"[OpenCode Error: {e}]")
-        yield err; yield done
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.error(f"[{request_id}] OpenCode streaming error: {e}")
+            err, done = yield_sse_error(model, f"[OpenCode Error: {e}]")
+            yield err; yield done
     finally:
+        if resp_cm is not None:
+            try:
+                await resp_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
         if owns_session:
             await session.close()
 
@@ -3561,7 +3865,6 @@ async def call_qwen_direct(system_prompt: Optional[str], messages: list, model: 
 
     api_model = model[len("qwen:"):]
     endpoint = f"{QWEN_BASE_URL}/chat/completions"
-    headers = qwen_auth.get_auth_headers()
 
     payload = {"model": api_model, "messages": build_oai_messages(system_prompt, messages)}
     payload.update({k: v for k, v in extra_params.items() if v is not None})
@@ -3571,21 +3874,25 @@ async def call_qwen_direct(system_prompt: Optional[str], messages: list, model: 
     start = time.time()
 
     session = qwen_auth.session or create_session()
-    try:
+
+    async def _do_call() -> str:
+        headers = qwen_auth.get_auth_headers()
         async with session.post(endpoint, json=payload, headers=headers) as resp:
-            elapsed = time.time() - start
             if resp.status in (400, 401, 403):
                 # Token may be stale — try reloading from file and retry once
+                # inline (this auth-recovery path must not be conflated with the
+                # 401/403 fail-fast rule in _with_retry).
                 if qwen_auth.reload_from_file():
-                    headers = qwen_auth.get_auth_headers()
-                    async with session.post(endpoint, json=payload, headers=headers) as retry_resp:
+                    retry_headers = qwen_auth.get_auth_headers()
+                    async with session.post(endpoint, json=payload, headers=retry_headers) as retry_resp:
                         if retry_resp.status == 200:
                             data = await retry_resp.json()
                             content = _extract_oai_content(data.get("choices", [{}])[0].get("message", {}))
                             if content:
-                                logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, Qwen)")
                                 return content
                 error_body = await resp.text()
+                # 401/403/400 on final failure — _with_retry will fail-fast on
+                # 401/403, and a 400 is not retryable either.
                 raise HTTPException(status_code=resp.status, detail=f"Qwen error — {error_body[:200]}. Run Qwen Code CLI to refresh auth.")
             if resp.status == 429:
                 raise HTTPException(status_code=429, detail="Qwen rate limit exceeded")
@@ -3600,10 +3907,16 @@ async def call_qwen_direct(system_prompt: Optional[str], messages: list, model: 
             content = _extract_oai_content(choices[0].get("message", {}))
             if content is None:
                 raise HTTPException(status_code=500, detail="Qwen returned empty content")
-            logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, Qwen)")
             return content
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Qwen request timed out")
+
+    try:
+        try:
+            content = await _with_retry(_do_call, operation=f"Qwen {api_model}", request_id=request_id)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Qwen request timed out")
+        elapsed = time.time() - start
+        logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, Qwen)")
+        return content
     finally:
         if not qwen_auth.session:
             await session.close()
@@ -3630,37 +3943,48 @@ async def call_qwen_streaming(system_prompt: Optional[str], messages: list, mode
 
     session = qwen_auth.session or create_session()
     owns_session = not qwen_auth.session
+    resp_cm = None
     try:
-        async with session.post(endpoint, json=payload, headers=headers) as resp:
-            if resp.status in (400, 401, 403):
-                # Token may be stale — reload from file and retry
-                if qwen_auth.reload_from_file():
-                    headers = qwen_auth.get_auth_headers()
-                    async with session.post(endpoint, json=payload, headers=headers) as retry_resp:
+        try:
+            resp, resp_cm = await _open_stream_with_retry(
+                session, endpoint,
+                json_payload=payload, headers=headers,
+                operation="Qwen", request_id=request_id,
+            )
+        except HTTPException as e:
+            # 400/401/403 — try a one-shot auth reload + retry before giving up.
+            if e.status_code in (400, 401, 403) and qwen_auth.reload_from_file():
+                retry_headers = qwen_auth.get_auth_headers()
+                try:
+                    async with session.post(endpoint, json=payload, headers=retry_headers) as retry_resp:
                         if retry_resp.status == 200:
                             async for event in passthrough_sse(retry_resp, request_id, "Qwen", start):
                                 yield event
                             yield "data: [DONE]\n\n"
                             return
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                    pass
                 err, done = yield_sse_error(model, "[Qwen Error: auth failed]")
                 yield err; yield done
                 return
+            err, done = yield_sse_error(model, f"[Qwen Error {e.status_code}]")
+            yield err; yield done
+            return
 
-            if resp.status != 200:
-                error_body = await resp.text()
-                logger.error(f"[{request_id}] Qwen {resp.status}: {error_body[:300]}")
-                err, done = yield_sse_error(model, f"[Qwen Error {resp.status}]")
-                yield err; yield done
-                return
-
+        try:
             async for event in passthrough_sse(resp, request_id, "Qwen", start):
                 yield event
             yield "data: [DONE]\n\n"
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        logger.error(f"[{request_id}] Qwen streaming error: {e}")
-        err, done = yield_sse_error(model, f"[Qwen Error: {e}]")
-        yield err; yield done
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.error(f"[{request_id}] Qwen streaming error: {e}")
+            err, done = yield_sse_error(model, f"[Qwen Error: {e}]")
+            yield err; yield done
     finally:
+        if resp_cm is not None:
+            try:
+                await resp_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
         if owns_session:
             await session.close()
 
@@ -3742,9 +4066,9 @@ async def call_fireworks_direct(system_prompt: Optional[str], messages: list, mo
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
-    try:
+
+    async def _do_call() -> str:
         async with session.post(endpoint, json=payload, headers=headers) as resp:
-            elapsed = time.time() - start
             if resp.status in (401, 403):
                 raise HTTPException(status_code=401, detail="Fireworks auth failed — check API key")
             if resp.status == 429:
@@ -3769,14 +4093,19 @@ async def call_fireworks_direct(system_prompt: Optional[str], messages: list, mo
                             retry_data = await retry_resp.json()
                             content = _extract_oai_content(retry_data.get("choices", [{}])[0].get("message", {}))
                             if content:
-                                logger.info(f"[{request_id}] <- {len(content)} chars ({time.time() - start:.1f}s, Fireworks, retry)")
                                 return content
                 logger.warning(f"[{request_id}] Fireworks returned null content, full response: {str(data)[:500]}")
                 raise HTTPException(status_code=500, detail="Fireworks returned empty content")
-            logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, Fireworks)")
             return content
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Fireworks request timed out")
+
+    try:
+        try:
+            content = await _with_retry(_do_call, operation=f"Fireworks {api_model}", request_id=request_id)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Fireworks request timed out")
+        elapsed = time.time() - start
+        logger.info(f"[{request_id}] <- {len(content)} chars ({elapsed:.1f}s, Fireworks)")
+        return content
     finally:
         if owns_session:
             await session.close()
@@ -3802,15 +4131,20 @@ async def call_fireworks_streaming(system_prompt: Optional[str], messages: list,
 
     session = third_party_session or auth.session or create_session()
     owns_session = session is not third_party_session and session is not auth.session
+    resp_cm = None
     try:
-        async with session.post(endpoint, json=payload, headers=headers) as resp:
-            if resp.status != 200:
-                error_body = await resp.text()
-                logger.error(f"[{request_id}] Fireworks {resp.status}: {error_body[:300]}")
-                err, done = yield_sse_error(model, f"[Fireworks Error {resp.status}]")
-                yield err; yield done
-                return
+        try:
+            resp, resp_cm = await _open_stream_with_retry(
+                session, endpoint,
+                json_payload=payload, headers=headers,
+                operation="Fireworks", request_id=request_id,
+            )
+        except HTTPException as e:
+            err, done = yield_sse_error(model, f"[Fireworks Error {e.status_code}]")
+            yield err; yield done
+            return
 
+        try:
             saw_done = False
             async for event in passthrough_sse(resp, request_id, "Fireworks", start):
                 if event.strip().startswith("data: [DONE]"):
@@ -3819,12 +4153,16 @@ async def call_fireworks_streaming(system_prompt: Optional[str], messages: list,
 
             if not saw_done:
                 yield "data: [DONE]\n\n"
-            return
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        logger.error(f"[{request_id}] Fireworks streaming error: {e}")
-        err, done = yield_sse_error(model, f"[Fireworks Error: {e}]")
-        yield err; yield done
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.error(f"[{request_id}] Fireworks streaming error: {e}")
+            err, done = yield_sse_error(model, f"[Fireworks Error: {e}]")
+            yield err; yield done
     finally:
+        if resp_cm is not None:
+            try:
+                await resp_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
         if owns_session:
             await session.close()
 
@@ -4070,6 +4408,7 @@ async def call_antigravity_direct(
     max_tokens: int,
 ) -> str:
     """Call Antigravity API directly with multi-account fallback on 503 errors."""
+    # Retry policy: not wrapped — see _with_retry docstring.
     if not antigravity_auth.is_ready:
         await antigravity_auth.refresh_if_needed()
         if not antigravity_auth.is_ready:
@@ -4232,6 +4571,7 @@ async def call_gemini_direct(
     max_tokens: int,
 ) -> str:
     """Call Gemini Code Assist API (cloudcode-pa.googleapis.com) with stored OAuth token."""
+    # Retry policy: not wrapped — see _with_retry docstring.
     if not gemini_auth.is_ready or gemini_auth.is_expired():
         if not await gemini_auth.refresh_if_needed():
             raise HTTPException(status_code=503, detail="Gemini auth not ready -- run 'gemini auth login'")
@@ -4301,6 +4641,7 @@ async def call_gemini_streaming(
     max_tokens: int,
 ):
     """Call Gemini API with SSE streaming."""
+    # Retry policy: not wrapped — see _with_retry docstring.
     if not gemini_auth.is_ready or gemini_auth.is_expired():
         if not await gemini_auth.refresh_if_needed():
             yield 'data: {"error": "Gemini auth not ready -- run gemini auth login"}\n\n'
@@ -4443,6 +4784,7 @@ async def call_antigravity_streaming(
     max_tokens: int,
 ):
     """Call Antigravity API with streaming and multi-account fallback on initial errors."""
+    # Retry policy: not wrapped — see _with_retry docstring.
     if not antigravity_auth.is_ready:
         await antigravity_auth.refresh_if_needed()
         if not antigravity_auth.is_ready:
@@ -6508,6 +6850,34 @@ async def set_max_total(request: Request):
     return {"status": "ok", "max_total_seconds": seconds}
 
 
+@app.get("/config/max-retries")
+async def get_max_retries():
+    """Return the current retry budget applied to OAI-compatible upstreams."""
+    return {"max_retries": max_retries}
+
+
+@app.post("/config/max-retries")
+async def set_max_retries(request: Request):
+    """Update the retry budget. Clamps to 0..10 and persists to config.json."""
+    global max_retries
+    data = await request.json()
+    raw = data.get("max_retries")
+    if raw is None:
+        raise HTTPException(status_code=400, detail="max_retries is required")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="max_retries must be an integer")
+    if n < 0 or n > 10:
+        raise HTTPException(status_code=400, detail="max_retries must be between 0 and 10")
+    max_retries = n
+    cfg = _load_config()
+    cfg["max_retries"] = n
+    _save_config(cfg)
+    logger.info(f"Retry policy updated: max_retries={n}")
+    return {"status": "saved", "max_retries": n}
+
+
 @app.get("/config/timeout-routing")
 async def get_timeout_routing():
     return {
@@ -7696,6 +8066,25 @@ async def dashboard():
     <pre id="requestStats" style="display:none;margin-top:10px;background:#0f172a;padding:10px;border-radius:6px;font-size:0.8rem;color:#94a3b8;overflow:auto"></pre>
   </div>
 
+  <!-- Retry Policy -->
+  <div class="card">
+    <h3 style="margin:0 0 8px; font-size:1rem; color:#f1f5f9">🔁 Retry Policy</h3>
+    <p style="margin:0 0 10px;color:#94a3b8;font-size:0.85rem">
+      Retries on 429/5xx and transient network errors. <code>0</code> disables retry; max <code>10</code>.
+      Applies to OAI-compatible upstreams (OpenRouter, Ollama, Z.AI, Xiaomi, OpenCode, Qwen, Fireworks, NVIDIA NIM).
+      Claude/Codex/Gemini CLI/Antigravity have their own mitigations and are not wrapped.
+    </p>
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap">
+      <label style="display:flex;gap:6px;align-items:center">
+        <span style="color:#94a3b8;font-size:0.85rem">Max retries (0–10):</span>
+        <input type="number" id="maxRetriesInput" value="{max_retries}" min="0" max="10" step="1"
+               style="width:60px;background:#1e293b;border:1px solid #334155;color:#f1f5f9;padding:4px 6px;border-radius:4px;font-size:0.85rem">
+        <button onclick="setMaxRetries()" style="margin-top:0;background:#334155;padding:4px 10px;font-size:0.8rem">Save</button>
+      </label>
+      <span id="maxRetriesStatus" style="color:#64748b;font-size:0.85rem;font-weight:600"></span>
+    </div>
+  </div>
+
   <!-- Quick Test -->
   <div class="card">
     <h3 style="margin:0 0 8px; font-size:1rem; color:#f1f5f9">Quick Test</h3>
@@ -8531,6 +8920,37 @@ async function setMaxTotal() {{
     input.value = data.max_total_seconds;
   }} catch(e) {{
     alert('Error: ' + e.message);
+  }}
+}}
+
+async function setMaxRetries() {{
+  const input = document.getElementById('maxRetriesInput');
+  const status = document.getElementById('maxRetriesStatus');
+  const n = parseInt(input.value, 10);
+  if (isNaN(n) || n < 0 || n > 10) {{
+    status.textContent = 'Must be 0..10';
+    status.style.color = '#f87171';
+    return;
+  }}
+  try {{
+    const resp = await fetch('/config/max-retries', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{max_retries: n}}),
+    }});
+    if (resp.ok) {{
+      const data = await resp.json();
+      input.value = data.max_retries;
+      status.textContent = 'Saved (' + data.max_retries + ')';
+      status.style.color = '#4ade80';
+    }} else {{
+      const err = await resp.json();
+      status.textContent = 'Error: ' + (err.detail || resp.status);
+      status.style.color = '#f87171';
+    }}
+  }} catch(e) {{
+    status.textContent = 'Error: ' + e.message;
+    status.style.color = '#f87171';
   }}
 }}
 
