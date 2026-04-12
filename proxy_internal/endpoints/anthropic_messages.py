@@ -46,7 +46,7 @@ async def anthropic_messages(request: Request):
     is_stream = bool(body.get("stream"))
     has_tools = bool(body.get("tools"))
 
-    # Route 1: structured tool_use passthrough.
+    # Route 1: structured tool_use passthrough (OAI-compatible providers).
     if has_tools:
         try:
             resolved = await proxy._resolve_oai_compatible(resolved_model)
@@ -55,16 +55,38 @@ async def anthropic_messages(request: Request):
             raise
         if resolved is not None:
             return await proxy._anthropic_messages_structured(body, resolved, resolved_model, is_stream)
-        # Soft-fallback: the requested model isn't OAI-compatible so we can't
-        # dispatch tools natively.  Flatten tools into the system prompt via the
-        # legacy text-only pipeline so the conversation keeps flowing under
-        # clients like CCS that tier-route to claude-*/gpt-5.*/antigravity-*
-        # models.  The assistant won't emit structured tool_use blocks — the
-        # caller gets a text response summarising what it would do.
+
+        # Route 2: native Claude passthrough. When the resolved model would
+        # default-route to Claude, forward the Anthropic-shaped body straight
+        # to api.anthropic.com using the MITM-captured auth headers. This
+        # preserves tools / tool_use / tool_result blocks end-to-end, which
+        # is the path CCS-routed Claude Code needs when it requests Claude
+        # models against this proxy.
+        if proxy._is_claude_default_model(resolved_model):
+            try:
+                return await proxy.call_claude_messages_passthrough(body, is_stream)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(
+                    "[/v1/messages] Claude passthrough failed for %r: %s — "
+                    "falling through to legacy text path",
+                    resolved_model, e,
+                )
+                # Fall through to Route 3 below rather than 500ing so the
+                # caller still gets a (degraded) text response.
+
+        # Route 3: Soft-fallback for non-OAI, non-Claude models (Codex,
+        # Antigravity, Gemini CLI). Flatten tools into the system prompt via
+        # the legacy text-only pipeline so the conversation keeps flowing,
+        # but the assistant can't emit structured tool_use blocks on these
+        # providers. Logged at WARNING so operators can see tool dispatch
+        # degrading.
         logger.warning(
             "[/v1/messages] Soft-fallback: tools present but model %r does not "
-            "route to an OAI-compatible provider (%s). Flattening through the "
-            "text-only path; tool dispatch is not available on this model.",
+            "route to an OAI-compatible provider (%s) nor to native Claude. "
+            "Flattening through the text-only path; tool dispatch is not "
+            "available on this model.",
             resolved_model, ", ".join(proxy._OAI_COMPATIBLE_PROVIDERS),
         )
         # Keep ``tools`` in the body: _anthropic_request_to_chat_request calls

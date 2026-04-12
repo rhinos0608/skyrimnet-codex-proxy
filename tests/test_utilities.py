@@ -143,6 +143,38 @@ def test_normalize_model_name_arbitrary_string(proxy_module):
     assert proxy_module.normalize_model_name("some-random-model") == "some-random-model"
 
 
+def test_chat_allowed_extra_includes_thinking(proxy_module):
+    assert "thinking" in proxy_module._CHAT_ALLOWED_EXTRA
+
+
+def test_default_thinking_disabled_when_caller_omits(proxy_module):
+    """When the caller sends no thinking param, the proxy should inject disabled."""
+    req = proxy_module.ChatRequest(
+        model="ollama:llama3.2",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    extra = {k: v for k, v in (req.model_extra or {}).items() if v is not None and k in proxy_module._CHAT_ALLOWED_EXTRA}
+    # Caller didn't send thinking — proxy should inject it
+    _caller_thinking = extra.get("thinking")
+    if _caller_thinking is None:
+        extra.setdefault("thinking", {"type": "disabled"})
+    assert extra["thinking"] == {"type": "disabled"}
+
+
+def test_caller_thinking_enabled_preserved(proxy_module):
+    """When the caller explicitly enables thinking, the proxy must not override."""
+    req = proxy_module.ChatRequest(
+        model="ollama:llama3.2",
+        messages=[{"role": "user", "content": "hello"}],
+        thinking={"type": "enabled", "budget_tokens": 10000},
+    )
+    extra = {k: v for k, v in (req.model_extra or {}).items() if v is not None and k in proxy_module._CHAT_ALLOWED_EXTRA}
+    _caller_thinking = extra.get("thinking")
+    if _caller_thinking is None:
+        extra.setdefault("thinking", {"type": "disabled"})
+    assert extra["thinking"] == {"type": "enabled", "budget_tokens": 10000}
+
+
 # ---------------------------------------------------------------------------
 # _make_streaming_gen routing dispatch
 # ---------------------------------------------------------------------------
@@ -216,6 +248,27 @@ def test_make_streaming_gen_uses_inline_oai_messages_for_fallback(proxy_module):
         )
     assert result is sentinel
     mock_fn.assert_called_once_with(None, oai_messages, "ollama:llama3.2", _MAX_TOKENS)
+
+
+def test_make_streaming_gen_preserves_extra_params_for_oai_fallback(proxy_module):
+    sentinel = MagicMock()
+    extra_params = {"thinking": {"type": "disabled"}}
+    with patch.object(proxy_module, "call_ollama_streaming", return_value=sentinel) as mock_fn:
+        result = proxy_module._make_streaming_gen(
+            _SYSTEM,
+            _MESSAGES,
+            "ollama:llama3.2",
+            _MAX_TOKENS,
+            extra_params=extra_params,
+        )
+    assert result is sentinel
+    mock_fn.assert_called_once_with(
+        None,
+        _MESSAGES,
+        "ollama:llama3.2",
+        _MAX_TOKENS,
+        thinking={"type": "disabled"},
+    )
 
 
 def test_make_streaming_gen_routes_claude_default(proxy_module):
@@ -352,6 +405,7 @@ def test_build_api_body_strips_template_baggage(proxy_module):
         proxy_module._cached_auth_blocks = saved_auth_blocks
 
 
+
 # ---------------------------------------------------------------------------
 # make_sse_error_chunk
 # ---------------------------------------------------------------------------
@@ -482,8 +536,7 @@ async def test_passthrough_sse_flushes_remaining_buffer(proxy_module):
 
 @pytest.mark.asyncio
 async def test_passthrough_sse_drops_reasoning_only_chunks(proxy_module):
-    """Reasoning-only deltas should be suppressed entirely."""
-    import json
+    """Reasoning-only deltas must be suppressed, never re-emitted as content."""
     import time
 
     mock_content = MagicMock()
@@ -521,3 +574,224 @@ async def test_passthrough_sse_strips_reasoning_fields_from_mixed_chunks(proxy_m
     payload = json.loads(events[0][len("data: "):].strip())
     delta = payload["choices"][0]["delta"]
     assert delta == {"content": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_passthrough_sse_with_rewrite_reasoning_only(proxy_module):
+    """Reasoning-only stream should be rewritten via fast LLM."""
+    import json
+    import time
+
+    # Import the real function directly from streaming module
+    from proxy_internal.streaming import passthrough_sse_with_rewrite
+
+    mock_content = MagicMock()
+    mock_content.iter_any.return_value = _async_bytes_iter([
+        b'data: {"choices":[{"delta":{"reasoning":"Let me think about this..."}}]}\n\n',
+        b'data: {"choices":[{"delta":{"reasoning":"The player asked about dragons."}}]}\n\n',
+    ])
+    mock_resp = MagicMock()
+    mock_resp.content = mock_content
+
+    # Mock the rewrite function
+    with patch("proxy_internal.streaming._rewrite_reasoning_to_dialogue", new_callable=AsyncMock) as mock_rewrite:
+        mock_rewrite.return_value = "Ah, dragons! Aye, I've heard tales of those beasts."
+
+        events = []
+        async for event in passthrough_sse_with_rewrite(
+            mock_resp, "req-rw1", "TestProvider", time.time(),
+            system_prompt="You are a Skyrim innkeeper.", model="test:model",
+        ):
+            events.append(event)
+
+        # Should have called the rewrite with accumulated reasoning
+        mock_rewrite.assert_called_once()
+        call_args = mock_rewrite.call_args
+        assert "Let me think about this..." in call_args[0][0]
+        assert "The player asked about dragons." in call_args[0][0]
+        assert call_args[0][1] == "You are a Skyrim innkeeper."
+
+        # Should emit one content chunk with rewritten text
+        assert len(events) == 1
+        payload = json.loads(events[0][len("data: "):].strip())
+        assert "Ah, dragons" in payload["choices"][0]["delta"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_passthrough_sse_with_rewrite_reasoning_only_preserves_done(proxy_module):
+    """Reasoning-only rewrite must still preserve the upstream stream terminator."""
+    import time
+
+    from proxy_internal.streaming import passthrough_sse_with_rewrite
+
+    mock_content = MagicMock()
+    mock_content.iter_any.return_value = _async_bytes_iter([
+        b'data: {"choices":[{"delta":{"reasoning":"thinking..."}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ])
+    mock_resp = MagicMock()
+    mock_resp.content = mock_content
+
+    with patch("proxy_internal.streaming._rewrite_reasoning_to_dialogue", new_callable=AsyncMock) as mock_rewrite:
+        mock_rewrite.return_value = "Stay close."
+
+        events = []
+        async for event in passthrough_sse_with_rewrite(
+            mock_resp, "req-rw1b", "TestProvider", time.time(),
+            system_prompt="You are an NPC.", model="test:model",
+        ):
+            events.append(event)
+
+        assert len(events) == 2
+        assert "Stay close." in events[0]
+        assert events[1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_passthrough_sse_with_rewrite_normalizes_structured_reasoning(proxy_module):
+    """Structured reasoning_details payloads must be normalized before rewrite."""
+    import time
+
+    from proxy_internal.streaming import passthrough_sse_with_rewrite
+
+    mock_content = MagicMock()
+    mock_content.iter_any.return_value = _async_bytes_iter([
+        (
+            b'data: {"choices":[{"delta":{"reasoning_details":'
+            b'[{"type":"text","text":"First thought."},{"type":"text","text":"Second thought."}]}}]}\n\n'
+        ),
+        b"data: [DONE]\n\n",
+    ])
+    mock_resp = MagicMock()
+    mock_resp.content = mock_content
+
+    with patch("proxy_internal.streaming._rewrite_reasoning_to_dialogue", new_callable=AsyncMock) as mock_rewrite:
+        mock_rewrite.return_value = "Move."
+
+        events = []
+        async for event in passthrough_sse_with_rewrite(
+            mock_resp, "req-rw1c", "TestProvider", time.time(),
+            system_prompt="You are an NPC.", model="test:model",
+        ):
+            events.append(event)
+
+        mock_rewrite.assert_called_once()
+        reasoning_text = mock_rewrite.call_args.args[0]
+        assert "First thought." in reasoning_text
+        assert "Second thought." in reasoning_text
+        assert events[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_passthrough_sse_with_rewrite_mixed_content(proxy_module):
+    """Hidden reasoning must stay hidden when real content later arrives."""
+    import json
+    import time
+
+    from proxy_internal.streaming import passthrough_sse_with_rewrite
+
+    mock_content = MagicMock()
+    mock_content.iter_any.return_value = _async_bytes_iter([
+        b'data: {"choices":[{"delta":{"reasoning":"thinking..."}}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":"Hello, traveler!"}}]}\n\n',
+    ])
+    mock_resp = MagicMock()
+    mock_resp.content = mock_content
+
+    with patch("proxy_internal.streaming._rewrite_reasoning_to_dialogue", new_callable=AsyncMock) as mock_rewrite:
+        events = []
+        async for event in passthrough_sse_with_rewrite(
+            mock_resp, "req-rw2", "TestProvider", time.time(),
+            system_prompt="You are an NPC.", model="test:model",
+        ):
+            events.append(event)
+
+        # Rewrite should NOT be called — real content was present
+        mock_rewrite.assert_not_called()
+
+        assert len(events) == 1
+        payload = json.loads(events[0][len("data: "):].strip())
+        assert payload["choices"][0]["delta"]["content"] == "Hello, traveler!"
+
+
+@pytest.mark.asyncio
+async def test_passthrough_sse_with_rewrite_real_content_only(proxy_module):
+    """Stream with only real content should pass through without rewrite."""
+    import time
+
+    from proxy_internal.streaming import passthrough_sse_with_rewrite
+
+    mock_content = MagicMock()
+    mock_content.iter_any.return_value = _async_bytes_iter([
+        b'data: {"choices":[{"delta":{"content":"Greetings!"}}]}\n\n',
+    ])
+    mock_resp = MagicMock()
+    mock_resp.content = mock_content
+
+    with patch("proxy_internal.streaming._rewrite_reasoning_to_dialogue", new_callable=AsyncMock) as mock_rewrite:
+        events = []
+        async for event in passthrough_sse_with_rewrite(
+            mock_resp, "req-rw3", "TestProvider", time.time(),
+            model="test:model",
+        ):
+            events.append(event)
+
+        mock_rewrite.assert_not_called()
+        assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_passthrough_sse_with_rewrite_failure_fallback(proxy_module):
+    """When rewrite fails, the proxy must fail closed rather than leak reasoning."""
+    import time
+
+    from proxy_internal.streaming import passthrough_sse_with_rewrite
+
+    mock_content = MagicMock()
+    mock_content.iter_any.return_value = _async_bytes_iter([
+        b'data: {"choices":[{"delta":{"reasoning":"Let me think..."}}]}\n\n',
+    ])
+    mock_resp = MagicMock()
+    mock_resp.content = mock_content
+
+    with patch("proxy_internal.streaming._rewrite_reasoning_to_dialogue", new_callable=AsyncMock) as mock_rewrite:
+        mock_rewrite.return_value = None  # Rewrite fails
+
+        events = []
+        async for event in passthrough_sse_with_rewrite(
+            mock_resp, "req-rw4", "TestProvider", time.time(),
+            system_prompt="You are an NPC.", model="test:model",
+        ):
+            events.append(event)
+
+        assert events == []
+
+
+@pytest.mark.asyncio
+async def test_streaming_request_uses_original_system_prompt_for_rewrite_context_and_resets(proxy_module):
+    """Rewrite context should use the original system prompt and be reset after streaming."""
+    seen = []
+
+    async def fake_stream(system_prompt, messages, model, max_tokens, **kwargs):
+        seen.append(dict(proxy_module._rewrite_ctx.get()))
+        yield "data: [DONE]\n\n"
+
+    req = proxy_module.ChatRequest(
+        model="ollama:llama3.2",
+        stream=True,
+        messages=[
+            {"role": "system", "content": "You are a Skyrim innkeeper."},
+            {"role": "user", "content": "Hello"},
+        ],
+    )
+
+    with patch.object(proxy_module, "call_ollama_streaming", side_effect=fake_stream), \
+         patch.object(proxy_module, "timeout_routing_enabled", False):
+        response = await proxy_module._chat_completions_inner(req)
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+
+    assert seen == [{"system_prompt": "You are a Skyrim innkeeper.", "model": "ollama:llama3.2"}]
+    assert proxy_module._rewrite_ctx.get() == {}
+    assert chunks == ["data: [DONE]\n\n"]

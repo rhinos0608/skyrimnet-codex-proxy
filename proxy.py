@@ -19,6 +19,7 @@ Optimizations:
 
 import asyncio
 import base64
+import contextvars
 import gc
 import json
 import random
@@ -115,7 +116,8 @@ from proxy_internal.retry import (
     _with_retry,
     _open_stream_with_retry,
 )
-from proxy_internal.streaming import _REASONING_FIELDS, passthrough_sse
+from proxy_internal.streaming import _REASONING_FIELDS, passthrough_sse, passthrough_sse_with_rewrite
+_passthrough_sse_original = passthrough_sse
 from proxy_internal.message_normalize import _model_uses_oai_messages
 # --- Phase 3 facade imports: provider modules ---
 from proxy_internal.providers.nvidia import (
@@ -167,6 +169,7 @@ from proxy_internal.providers.claude import (
     call_api_direct,
     call_api_streaming,
     _build_api_body,
+    call_claude_messages_passthrough,
 )
 from proxy_internal.providers.antigravity import (
     call_antigravity_direct,
@@ -287,6 +290,7 @@ _CHAT_ALLOWED_EXTRA = {
     "logit_bias",
     "n",
     "reasoning",
+    "thinking",
 }
 
 
@@ -414,7 +418,74 @@ max_total_seconds: float = _cfg.get("max_total_seconds", 9.0)
 max_retries: int = _load_max_retries(_cfg)
 logger.info(f"Timeout routing: {'enabled' if timeout_routing_enabled else 'disabled'} (TTFT cutoff {timeout_cutoff_seconds}s, max total {max_total_seconds}s)")
 logger.info(f"Retry policy: max_retries={max_retries}")
+
+# --- Reasoning override (dashboard toggle) ---
+#
+# When CCS (Claude Code Switcher) routes through this proxy on the ``proxy``
+# profile, its per-tier ``thinking.tier_defaults`` only flow to CCS's own
+# cliproxy providers — requests into us arrive with ``thinking`` absent, and
+# the request pipeline then forces ``thinking={"type":"disabled"}``. The
+# override below lets dashboard operators flip the default back on at a
+# configurable effort level so Claude Code gets reasoning again even through
+# CCS. OFF by default so existing callers see unchanged behavior.
+reasoning_override_enabled: bool = bool(_cfg.get("reasoning_override_enabled", False))
+reasoning_override_level: str = _cfg.get("reasoning_override_level", "medium")
+if reasoning_override_level not in ("low", "medium", "high"):
+    reasoning_override_level = "medium"
+logger.info(
+    f"Reasoning override: {'enabled' if reasoning_override_enabled else 'disabled'} "
+    f"(level={reasoning_override_level})"
+)
+
+# Anthropic ``thinking.budget_tokens`` bucket per override level. Numbers are
+# order-of-magnitude estimates used by Claude / Anthropic-shaped bodies; OAI
+# providers ignore the field entirely.
+_THINKING_BUDGET_BY_LEVEL = {"low": 2048, "medium": 8192, "high": 24576}
+
+
+def _override_thinking_payload(max_tokens: int = 0) -> dict:
+    """Return the Anthropic-shaped ``thinking`` dict to inject when override is on.
+
+    If ``max_tokens`` is given and positive, clamp ``budget_tokens`` to
+    ``max(1024, max_tokens - 1)`` so Anthropic doesn't reject the request.
+    """
+    budget = _THINKING_BUDGET_BY_LEVEL.get(reasoning_override_level, 8192)
+    if max_tokens > 0:
+        budget = min(budget, max(1024, max_tokens - 1))
+    return {"type": "enabled", "budget_tokens": budget}
+
+
+def _active_codex_reasoning_effort() -> str:
+    """Return the effective ``model_reasoning_effort`` for Codex requests.
+
+    When the dashboard reasoning override is on, Codex uses the override level
+    (``low``/``medium``/``high``) rather than the hard-coded fast-mode default.
+    """
+    if reasoning_override_enabled:
+        return reasoning_override_level
+    return CODEX_FAST_REASONING_EFFORT
 _round_robin_counter: int = 0
+reasoning_rewrite_enabled: bool = _cfg.get("reasoning_rewrite_enabled", False)
+logger.info(f"Reasoning rewrite: {'enabled' if reasoning_rewrite_enabled else 'disabled'}")
+
+# Contextvar for per-request rewrite context (set in streaming path, read by passthrough_sse wrapper)
+_rewrite_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("rewrite_ctx", default={})
+
+
+def _passthrough_sse_dispatch(resp, request_id, provider_name, start, **kw):
+    """Dispatch to rewrite-aware passthrough when rewrite context is set, otherwise original."""
+    ctx = _rewrite_ctx.get()
+    if reasoning_rewrite_enabled and ctx:
+        return passthrough_sse_with_rewrite(
+            resp, request_id, provider_name, start,
+            system_prompt=ctx.get("system_prompt"),
+            model=ctx.get("model", ""),
+        )
+    return _passthrough_sse_original(resp, request_id, provider_name, start, **kw)
+
+
+# Replace the module-level attribute so all providers use the dispatch
+passthrough_sse = _passthrough_sse_dispatch
 
 
 # --- Per-model latency / reliability stats (in-memory, rolling window) ---
@@ -470,8 +541,12 @@ class ModelStatsTracker:
             }
         return out
 
-    def get_reliable_model(self, exclude: str) -> Optional[str]:
-        """Return a reliable fallback model, excluding the given one.
+    def get_reliable_model(self, exclude) -> Optional[str]:
+        """Return a reliable fallback model, excluding the given one(s).
+
+        `exclude` may be a single model name (str) or an iterable of names to
+        skip — used by the cascading fallback path in `_with_timeout_routing`,
+        which needs to keep asking for "the next best" model after each failure.
 
         Selection strategy (tiered):
           1. **Fast tier** — models with median TTFT < 3.0s AND success_rate >= 0.8.
@@ -483,10 +558,18 @@ class ModelStatsTracker:
         Score = success_rate * 0.6 + speed_score * 0.3 + sample_confidence * 0.1
         Uses both TTFT stats and full request_stats for richer signal.
         """
+        # Normalize exclude to a set for uniform membership checks.
+        if exclude is None:
+            exclude_set = set()
+        elif isinstance(exclude, str):
+            exclude_set = {exclude}
+        else:
+            exclude_set = set(exclude)
+
         candidates = []       # all viable (success_rate >= 0.7)
         fast_candidates = []  # subset: median_ttft < 3.0 AND success_rate >= 0.8
         for model, records in self._records.items():
-            if model == exclude or len(records) < 5:
+            if model in exclude_set or len(records) < 5:
                 continue
             ttfts = [t for t, s in records if s]
             if not ttfts:
@@ -745,53 +828,182 @@ def pick_model_round_robin(models: list[str]) -> str:
     return model
 
 
-def _pick_fallback_model(exclude_model: str) -> str:
-    """Select the most reliable model from observed stats, or a safe provider default."""
-    best = model_stats.get_reliable_model(exclude=exclude_model)
+def _pick_fallback_model(exclude_model=None, *, exclude=None):
+    """Select the most reliable model from observed stats, or a safe provider default.
+
+    Accepts either `exclude_model` (legacy, str) or `exclude` (str or iterable).
+    Used by the cascading fallback path, which needs to pass an ever-growing
+    set of already-tried models. Returns None if no candidate outside the
+    excluded set is available — callers should then stop cascading.
+    """
+    excluded = exclude if exclude is not None else exclude_model
+    if excluded is None:
+        excluded_set: set = set()
+    elif isinstance(excluded, str):
+        excluded_set = {excluded}
+    else:
+        excluded_set = set(excluded)
+
+    best = model_stats.get_reliable_model(exclude=excluded_set)
     if best:
         return best
-    # Provider defaults in reliability priority order
+    # Provider defaults in reliability priority order — only returned if not
+    # already tried, so the cascade doesn't loop on the same hard-coded pick.
+    defaults = []
     if auth.is_ready:
-        return DEFAULT_MODEL
+        defaults.append(DEFAULT_MODEL)
     if antigravity_auth.is_ready:
-        return "antigravity-gemini-2.5-flash"
+        defaults.append("antigravity-gemini-2.5-flash")
     if codex_auth.is_ready:
-        return DEFAULT_CODEX_MODEL
+        defaults.append(DEFAULT_CODEX_MODEL)
     if gemini_auth.is_ready:
-        return "gcli-gemini-2.5-flash"
-    return DEFAULT_MODEL
+        defaults.append("gcli-gemini-2.5-flash")
+    for d in defaults:
+        if d not in excluded_set:
+            return d
+    # Legacy behavior: when no exclude set is given and nothing is ready,
+    # still return DEFAULT_MODEL so single-shot callers get a non-None result.
+    if not excluded_set:
+        return DEFAULT_MODEL
+    return None
 
 
-def _make_streaming_gen(system_prompt, messages, model, max_tokens, oai_messages=None):
-    """Route a model name to its streaming generator (no extra_params — used for fallback)."""
+def _chunk_has_content(chunk) -> bool:
+    """Cheap check: does this SSE chunk carry a non-empty delta.content?
+
+    Used by timeout routing to detect the first real content chunk (TTFT).
+    Role/setup/[DONE] chunks return False; chunks with actual text return True.
+    The string-level guards (`startswith`, `'"content"' in chunk`) avoid the
+    json.loads cost on the vast majority of chunks that don't have content.
+    """
+    try:
+        if not (isinstance(chunk, str) and chunk.startswith("data: ")
+                and "[DONE]" not in chunk and '"content"' in chunk):
+            return False
+        data = json.loads(chunk[6:])
+        delta = data.get("choices", [{}])[0].get("delta", {})
+        return bool(delta.get("content"))
+    except Exception:
+        return False
+
+
+def _synthetic_stop_done_chunks(model: str):
+    """Build a (stop + [DONE]) SSE pair for a failed/exhausted cascade.
+
+    Clients (SkyrimNet) treat a proper finish_reason="stop" + [DONE] as a
+    natural completion and don't retry — without this, the game fires a second
+    request and we see the "two generations per call" pattern.
+    """
+    stop_chunk = {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    return [f"data: {json.dumps(stop_chunk)}\n\n", "data: [DONE]\n\n"]
+
+
+def _is_claude_default_model(model: str) -> bool:
+    """True when the given model would default-route to Claude (Anthropic).
+
+    Mirrors the routing decision in ``_chat_completions_inner`` / the
+    ``_make_streaming_gen`` else-branch: a model belongs to Claude iff no
+    provider-specific prefix detector matches it. Used by /v1/messages to
+    decide between the structured OAI tool path, the native Claude passthrough,
+    and the legacy text-only soft-fallback.
+    """
+    model = normalize_model_name(model)
+    if is_ollama_model(model):
+        return False
+    if is_openrouter_model(model):
+        return False
+    if is_codex_model(model):
+        return False
+    if is_antigravity_model(model):
+        return False
+    if is_gemini_cli_model(model):
+        return False
+    if is_zai_model(model):
+        return False
+    if is_xiaomi_model(model):
+        return False
+    if is_opencode_model(model):
+        return False
+    if is_qwen_model(model):
+        return False
+    if is_fireworks_model(model):
+        return False
+    if is_nvidia_model(model):
+        return False
+    return True
+
+
+def _make_streaming_gen(system_prompt, messages, model, max_tokens, oai_messages=None, extra_params=None, request_id=None):
+    """Route a model name to its streaming generator.
+
+    ``extra_params`` are threaded through timeout-routed fallbacks so a request
+    that disabled reasoning/thinking doesn't silently lose that constraint when
+    the proxy switches models.
+    """
     model = normalize_model_name(model)
     routed_system_prompt = system_prompt
     routed_messages = messages
+    routed_extra_params = extra_params or {}
     if _model_uses_oai_messages(model):
         routed_system_prompt = None
         routed_messages = oai_messages if oai_messages is not None else messages
+
+    # Codex/Antigravity/Gemini CLI streaming entry points do not accept
+    # **extra_params — their reasoning/thinking controls live inside the
+    # subprocess config (Codex) or provider-specific request shape. If the
+    # caller supplied a non-trivial reasoning/thinking payload and the
+    # timeout-routing cascade lands on one of these providers, warn so the
+    # operator can diagnose ("why did my enabled reasoning vanish?").
+    def _warn_if_dropping_reasoning(provider: str) -> None:
+        if not routed_extra_params:
+            return
+        thinking = routed_extra_params.get("thinking")
+        effort = routed_extra_params.get("reasoning_effort")
+        interesting = False
+        if isinstance(thinking, dict) and thinking.get("type") not in (None, "disabled"):
+            interesting = True
+        if effort is not None:
+            interesting = True
+        if not interesting:
+            return
+        rid = f"[{request_id}] " if request_id else ""
+        logger.warning(
+            f"{rid}fallback {provider} dropping reasoning params "
+            f"(thinking={thinking!r}, reasoning_effort={effort!r}) — "
+            f"provider does not plumb extra_params; reasoning will NOT be forwarded"
+        )
+
     if is_ollama_model(model):
-        return call_ollama_streaming(routed_system_prompt, routed_messages, model, max_tokens)
+        return call_ollama_streaming(routed_system_prompt, routed_messages, model, max_tokens, **routed_extra_params)
     if is_openrouter_model(model):
-        return call_openrouter_streaming(routed_system_prompt, routed_messages, model, max_tokens)
+        return call_openrouter_streaming(routed_system_prompt, routed_messages, model, max_tokens, **routed_extra_params)
     if is_codex_model(model):
+        _warn_if_dropping_reasoning("Codex")
         return call_codex_streaming(routed_system_prompt, routed_messages, model, max_tokens)
     if is_antigravity_model(model):
+        _warn_if_dropping_reasoning("Antigravity")
         return call_antigravity_streaming(routed_system_prompt, routed_messages, model, max_tokens)
     if is_gemini_cli_model(model):
+        _warn_if_dropping_reasoning("Gemini CLI")
         return call_gemini_streaming(routed_system_prompt, routed_messages, model, max_tokens)
     if is_zai_model(model):
-        return call_zai_streaming(routed_system_prompt, routed_messages, model, max_tokens)
+        return call_zai_streaming(routed_system_prompt, routed_messages, model, max_tokens, **routed_extra_params)
     if is_xiaomi_model(model):
-        return call_xiaomi_streaming(routed_system_prompt, routed_messages, model, max_tokens)
+        return call_xiaomi_streaming(routed_system_prompt, routed_messages, model, max_tokens, **routed_extra_params)
     if is_opencode_model(model):
-        return call_opencode_streaming(routed_system_prompt, routed_messages, model, max_tokens)
+        return call_opencode_streaming(routed_system_prompt, routed_messages, model, max_tokens, **routed_extra_params)
     if is_qwen_model(model):
-        return call_qwen_streaming(routed_system_prompt, routed_messages, model, max_tokens)
+        return call_qwen_streaming(routed_system_prompt, routed_messages, model, max_tokens, **routed_extra_params)
     if is_fireworks_model(model):
-        return call_fireworks_streaming(routed_system_prompt, routed_messages, model, max_tokens)
+        return call_fireworks_streaming(routed_system_prompt, routed_messages, model, max_tokens, **routed_extra_params)
     if is_nvidia_model(model):
-        return call_nvidia_streaming(routed_system_prompt, routed_messages, model, max_tokens)
+        return call_nvidia_streaming(routed_system_prompt, routed_messages, model, max_tokens, **routed_extra_params)
     return call_api_streaming(routed_system_prompt, routed_messages, model, max_tokens)
 
 
@@ -838,7 +1050,10 @@ async def _stream_under_deadline(aiter, model, total_deadline, start_time, total
         yield chunk
 
 
-async def _with_timeout_routing(gen, system_prompt, messages, oai_messages, model, max_tokens, ttft_timeout=None, total_timeout=None):
+async def _with_timeout_routing(
+    gen, system_prompt, messages, oai_messages, model, max_tokens,
+    ttft_timeout=None, total_timeout=None, extra_params=None,
+):
     """
     Wrap a streaming generator with two deadlines:
 
@@ -885,33 +1100,135 @@ async def _with_timeout_routing(gen, system_prompt, messages, oai_messages, mode
                 pass
             elapsed = time.time() - start
             model_stats.record(model, elapsed, success=False)
-            fallback = _pick_fallback_model(exclude_model=model)
             logger.warning(
                 f"[timeout-routing] {model} exceeded pre-content deadline "
-                f"({elapsed:.1f}s, TTFT cutoff {ttft_timeout}s / total cap {total_timeout}s) — switching to {fallback}"
+                f"({elapsed:.1f}s, TTFT cutoff {ttft_timeout}s / total cap {total_timeout}s) — cascading to fallbacks"
             )
-            # Don't replay pre_content_chunks — the fallback generator will emit
-            # its own role chunk. Replaying would send duplicate role/setup chunks.
-            # The fallback stream shares the original `total_deadline` so a slow
-            # fallback still gets hard-cut at `max_total_seconds` from the original
-            # request start — otherwise a stuck fallback could run indefinitely.
-            fallback_gen = _make_streaming_gen(system_prompt, messages, fallback, max_tokens, oai_messages)
-            try:
-                async for c in _stream_under_deadline(
-                    fallback_gen.__aiter__(),
-                    fallback,
-                    total_deadline,
-                    start,
-                    total_timeout,
-                    closer=fallback_gen.aclose,
-                ):
-                    yield c
-            except Exception as e:
-                logger.error(f"[timeout-routing] Fallback {fallback} failed: {e}")
+            # Cascade through reliable fallbacks until one produces content,
+            # time runs out, or the candidate pool is exhausted. Before this
+            # loop existed we only tried a single fallback and handed it to
+            # _stream_under_deadline — if that fallback also failed before
+            # producing content, the client got a synthetic empty [DONE] and
+            # the game fired a retry (see 2026-04-12 logs: ollama:gemma4 →
+            # fireworks:kimi-k2p5-turbo both timed out, game retried with 2 msgs).
+            tried: set = {model}
+            MAX_CASCADE = 5  # hard cap so a buggy _pick_fallback_model can't loop
+            fb_model = None  # last fallback name, for the exhaustion log below
+            for _ in range(MAX_CASCADE):
+                if time.time() >= total_deadline:
+                    break
+                fb_model = _pick_fallback_model(exclude=tried)
+                if not fb_model or fb_model in tried:
+                    break
+                tried.add(fb_model)
+
+                fb_gen = _make_streaming_gen(
+                    system_prompt, messages, fb_model, max_tokens,
+                    oai_messages, extra_params=extra_params,
+                )
+                fb_iter = fb_gen.__aiter__()
+                fb_start = time.time()
+                fb_pre_chunks = []
+                fb_got_content = False
+                fb_ended_cleanly = False
+
+                # Per-fallback Phase 1: bound the wait for first content by
+                # min(ttft_timeout, remaining_total). This is the key change vs.
+                # the old path, which gave each fallback the full remaining
+                # total budget — one slow fallback could eat all of it.
+                fb_ttft_deadline = min(fb_start + ttft_timeout, total_deadline)
                 try:
-                    await fallback_gen.aclose()
-                except Exception:
-                    pass
+                    while True:
+                        rem = fb_ttft_deadline - time.time()
+                        if rem <= 0:
+                            raise asyncio.TimeoutError()
+                        fc = await asyncio.wait_for(fb_iter.__anext__(), timeout=rem)
+                        fb_pre_chunks.append(fc)
+                        if _chunk_has_content(fc):
+                            fb_got_content = True
+                            break
+                except StopAsyncIteration:
+                    # Fallback completed before producing content (empty stream).
+                    # Forward what it emitted (role chunks, terminators) so the
+                    # client sees something coherent, then stop cascading.
+                    fb_ended_cleanly = True
+                    try:
+                        await fb_gen.aclose()
+                    except Exception:
+                        pass
+                    model_stats.record(fb_model, time.time() - fb_start, success=False)
+                except asyncio.TimeoutError:
+                    try:
+                        await fb_gen.aclose()
+                    except Exception:
+                        pass
+                    model_stats.record(fb_model, time.time() - fb_start, success=False)
+                    logger.warning(
+                        f"[timeout-routing] fallback {fb_model} exceeded TTFT "
+                        f"({time.time() - fb_start:.1f}s) — trying next candidate"
+                    )
+                    continue
+                except Exception as e:
+                    try:
+                        await fb_gen.aclose()
+                    except Exception:
+                        pass
+                    model_stats.record(fb_model, time.time() - fb_start, success=False)
+                    logger.error(
+                        f"[timeout-routing] fallback {fb_model} errored before first token: {e} — trying next candidate"
+                    )
+                    continue
+
+                if fb_ended_cleanly:
+                    for c in fb_pre_chunks:
+                        yield c
+                    if not any(isinstance(c, str) and "[DONE]" in c for c in fb_pre_chunks):
+                        for c in _synthetic_stop_done_chunks(fb_model):
+                            yield c
+                    return
+
+                # Success: fallback produced real content. Flush its pre-content
+                # chunks (role + first content), then stream the remainder under
+                # the shared total_deadline so a slow mid-stream fallback still
+                # gets hard-cut at max_total_seconds from the ORIGINAL request start.
+                if fb_got_content:
+                    model_stats.record(fb_model, time.time() - fb_start, success=True)
+                    logger.info(
+                        f"[timeout-routing] fallback {fb_model} started streaming "
+                        f"after {time.time() - fb_start:.1f}s — continuing under total cap"
+                    )
+                    for c in fb_pre_chunks:
+                        yield c
+                    try:
+                        async for c in _stream_under_deadline(
+                            fb_iter,
+                            fb_model,
+                            total_deadline,
+                            fb_start,
+                            total_timeout,
+                            closer=fb_gen.aclose,
+                        ):
+                            yield c
+                    except Exception as e:
+                        logger.error(
+                            f"[timeout-routing] fallback {fb_model} errored mid-stream: {e}"
+                        )
+                        # Content already flowing to the client — can't re-route
+                        # mid-stream, but we must close cleanly or the game retries.
+                        for c in _synthetic_stop_done_chunks(fb_model):
+                            yield c
+                    return
+
+            # Cascade exhausted — no fallback produced content. Emit a synthetic
+            # stop+[DONE] so the client treats the call as a (silent) completion
+            # instead of retrying. This path is why we track fb_model above:
+            # the log should identify which pool we drained.
+            logger.error(
+                f"[timeout-routing] cascade exhausted (tried {len(tried)} models: "
+                f"{sorted(tried)}) — emitting synthetic empty stop"
+            )
+            for c in _synthetic_stop_done_chunks(model):
+                yield c
             return
 
         pre_content_chunks.append(chunk)
@@ -1188,10 +1505,35 @@ async def _chat_completions_inner(req: ChatRequest):
     if req.temperature is not None:
         extra_params.setdefault("temperature", req.temperature)
 
+    # Thinking/reasoning precedence (highest first):
+    #   1. Dashboard reasoning override ON → force-enable at configured level,
+    #      overriding whatever the caller sent. This is how CCS-routed Claude
+    #      Code gets reasoning back on: CCS's per-tier thinking defaults only
+    #      apply to its own cliproxy providers, so every CCS request hits us
+    #      with ``thinking`` absent and would otherwise be silenced by (3).
+    #   2. Caller supplied ``thinking`` → preserve verbatim. Legacy behavior
+    #      for explicit SkyrimNet / game callers that know what they want.
+    #   3. Otherwise → default to disabled. Without this, reasoning models
+    #      (kimi-k2, mimo-v2, minimax, etc.) produce chain-of-thought tokens
+    #      that get scrubbed server-side, leaving 0-char responses.
+    if reasoning_override_enabled:
+        extra_params["thinking"] = _override_thinking_payload(max_tokens)
+        # OAI providers (OpenRouter, Ollama, Fireworks, etc.) look for
+        # ``reasoning_effort``; Anthropic providers read ``thinking``. Inject
+        # both so whichever field the downstream provider honours is set.
+        extra_params["reasoning_effort"] = reasoning_override_level
+    else:
+        _caller_thinking = extra_params.get("thinking")
+        if _caller_thinking is None:
+            extra_params.setdefault("thinking", {"type": "disabled"})
+
     def _stream(gen):
         """Wrap a streaming generator with timeout routing if enabled."""
         if timeout_routing_enabled:
-            return _with_timeout_routing(gen, system_prompt, merged, oai_messages, model, max_tokens)
+            return _with_timeout_routing(
+                gen, system_prompt, merged, oai_messages, model, max_tokens,
+                extra_params=kwargs,
+            )
         return gen
 
     async def _tracked_stream(gen):
@@ -1250,9 +1592,32 @@ async def _chat_completions_inner(req: ChatRequest):
     call_system_prompt = None if _model_uses_oai_messages(model) else system_prompt
     call_messages = oai_messages if _model_uses_oai_messages(model) else merged
     kwargs = extra_params if use_extra else {}
+
+    # Warn if the reasoning override is active but won't reach the provider.
+    # Claude and Codex are handled directly (see _build_api_body and
+    # _active_codex_reasoning_effort); for providers that strip thinking/
+    # reasoning via their payload fixup, the override silently vanishes.
+    if reasoning_override_enabled and not use_extra and not use_codex:
+        # Claude is handled inside _build_api_body; Codex via the effort helper.
+        # Antigravity and Gemini CLI don't accept thinking — warn.
+        if use_antigravity or use_gemini_cli:
+            logger.warning(
+                f"Reasoning override active but provider "
+                f"{'Antigravity' if use_antigravity else 'Gemini CLI'} does not "
+                f"support thinking/reasoning params — override has no effect for "
+                f"this request"
+            )
+
     if req.stream:
+        async def _stream_with_rewrite_context():
+            token = _rewrite_ctx.set({"system_prompt": system_prompt, "model": model})
+            try:
+                async for chunk in _tracked_stream(_stream(stream_fn(call_system_prompt, call_messages, model, max_tokens, **kwargs))):
+                    yield chunk
+            finally:
+                _rewrite_ctx.reset(token)
         return StreamingResponse(
-            _tracked_stream(_stream(stream_fn(call_system_prompt, call_messages, model, max_tokens, **kwargs))),
+            _stream_with_rewrite_context(),
             media_type="text/event-stream",
             headers=_STREAMING_HEADERS,
         )

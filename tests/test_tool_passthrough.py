@@ -793,26 +793,25 @@ class TestMessagesEndpointStructured:
         assert tool_blocks[0]["input"] == {"cmd": "ls"}
 
     def test_tools_on_non_oai_model_soft_fallback(self, test_client, proxy_module, caplog):
-        """Tools + non-OAI model now soft-falls-back onto the legacy text-only
-        path with a warning, instead of returning HTTP 400.  This keeps clients
-        like CCS (which tier-route to claude-*/gpt-5.*/antigravity-* models)
-        working — they just won't get structured tool dispatch on that turn.
+        """Tools + Codex/Antigravity/Gemini-CLI model soft-falls-back onto the
+        legacy text-only path with a warning (Route C). Route B (native Claude
+        passthrough) covers claude-* models; this test covers the remaining
+        non-OAI providers that don't speak Anthropic's tool protocol natively.
 
         Also asserts that the tool catalogue DOES reach the model via the
         text path's ``_anthropic_tools_to_system_hint`` — dropping tool
         dispatch should not mean dropping tool awareness.
         """
-        mock_auth = MagicMock(is_ready=True, session=MagicMock(), headers={},
-                              body_template={"messages": []})
+        mock_antigravity_auth = MagicMock(is_ready=True)
         mock_direct = AsyncMock(return_value="I would run that command for you.")
-        with patch.object(proxy_module, "auth", mock_auth), \
-             patch.object(proxy_module, "call_api_direct", mock_direct), \
+        with patch.object(proxy_module, "antigravity_auth", mock_antigravity_auth), \
+             patch.object(proxy_module, "call_antigravity_direct", mock_direct), \
              patch.object(proxy_module, "request_stats", MagicMock(record=MagicMock())), \
              caplog.at_level("WARNING", logger=proxy_module.logger.name):
             resp = test_client.post(
                 "/v1/messages",
                 json={
-                    "model": "claude-sonnet-4-6",
+                    "model": "antigravity-gemini-2.5-flash",
                     "max_tokens": 100,
                     "messages": [{"role": "user", "content": "hi"}],
                     "tools": [{
@@ -842,10 +841,54 @@ class TestMessagesEndpointStructured:
         assert "Bash" in system_prompt_arg
         assert "Run a command" in system_prompt_arg
 
+    def test_tools_on_claude_model_routes_to_native_passthrough(self, test_client, proxy_module):
+        """Route B regression: tools + claude-* must invoke the native
+        /v1/messages passthrough, NOT the legacy text-only soft-fallback.
+        This is the fix for CCS-routed Claude Code — it was losing tool
+        dispatch entirely before the passthrough existed.
+        """
+        from fastapi.responses import JSONResponse
+        passthrough_stub = AsyncMock(
+            return_value=JSONResponse({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "routed via passthrough"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })
+        )
+        mock_auth = MagicMock(is_ready=True)
+        with patch.object(proxy_module, "auth", mock_auth), \
+             patch.object(proxy_module, "call_claude_messages_passthrough", passthrough_stub):
+            resp = test_client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{
+                        "name": "Bash",
+                        "description": "Run a command",
+                        "input_schema": {"type": "object"},
+                    }],
+                },
+            )
+        assert resp.status_code == 200
+        assert passthrough_stub.await_count == 1
+        # Verify the raw body + stream flag were forwarded.
+        called_body, called_stream = passthrough_stub.await_args.args
+        assert called_stream is False
+        assert called_body["model"] == "claude-sonnet-4-6"
+        assert called_body["tools"][0]["name"] == "Bash"
+
     def test_tools_on_non_oai_model_soft_fallback_streaming(self, test_client, proxy_module, caplog):
-        """Streaming variant of the soft-fallback: tools + claude-* + stream=True
-        must produce an Anthropic SSE stream (via the text-only pipeline) and
-        emit the Soft-fallback warning."""
+        """Streaming variant of the soft-fallback: tools + Antigravity model +
+        stream=True must produce an Anthropic SSE stream (via the text-only
+        pipeline) and emit the Soft-fallback warning. Claude-* is now handled
+        by Route B passthrough; this test covers Route C for the remaining
+        non-OAI providers (Codex/Antigravity/Gemini CLI)."""
         async def _fake_claude_stream(system_prompt, messages, model, max_tokens):
             # Emit a minimal OpenAI SSE stream with two text deltas, like the
             # real call_api_streaming() does.
@@ -872,18 +915,17 @@ class TestMessagesEndpointStructured:
             yield f"data: {_json.dumps(done)}\n\n"
             yield "data: [DONE]\n\n"
 
-        mock_auth = MagicMock(is_ready=True, session=MagicMock(), headers={},
-                              body_template={"messages": []})
-        with patch.object(proxy_module, "auth", mock_auth), \
-             patch.object(proxy_module, "call_api_streaming",
-                          return_value=_fake_claude_stream(None, [], "claude-sonnet-4-6", 100)), \
+        mock_antigravity_auth = MagicMock(is_ready=True)
+        with patch.object(proxy_module, "antigravity_auth", mock_antigravity_auth), \
+             patch.object(proxy_module, "call_antigravity_streaming",
+                          return_value=_fake_claude_stream(None, [], "antigravity-gemini-2.5-flash", 100)), \
              patch.object(proxy_module, "timeout_routing_enabled", False), \
              patch.object(proxy_module, "request_stats", MagicMock(record=MagicMock())), \
              caplog.at_level("WARNING", logger=proxy_module.logger.name):
             resp = test_client.post(
                 "/v1/messages",
                 json={
-                    "model": "claude-sonnet-4-6",
+                    "model": "antigravity-gemini-2.5-flash",
                     "max_tokens": 100,
                     "stream": True,
                     "messages": [{"role": "user", "content": "hi"}],
@@ -968,3 +1010,84 @@ class TestMessagesEndpointStructured:
         assert '"type":"tool_use"' in body or '"type": "tool_use"' in body
         assert '"name":"Bash"' in body or '"name": "Bash"' in body
         assert "event: message_stop" in body
+
+    def test_route_b_claude_passthrough_streaming(self, test_client, proxy_module):
+        """Route B with stream=True should return SSE bytes from the passthrough."""
+        from fastapi.responses import StreamingResponse
+
+        # The real call_claude_messages_passthrough returns a StreamingResponse
+        # when stream=True, yielding raw Anthropic SSE bytes verbatim.
+        sse_bytes = (
+            b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_t","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}\n\n'
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}\n\n'
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"cmd\\":\\"ls\\"}"}}\n\n'
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}\n\n'
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        )
+
+        async def _fake_stream_iter():
+            yield sse_bytes
+
+        passthrough_stub = AsyncMock(
+            return_value=StreamingResponse(
+                _fake_stream_iter(),
+                media_type="text/event-stream",
+            )
+        )
+        mock_auth = MagicMock(is_ready=True)
+        with patch.object(proxy_module, "auth", mock_auth), \
+             patch.object(proxy_module, "call_claude_messages_passthrough", passthrough_stub):
+            resp = test_client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 100,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "list files"}],
+                    "tools": [{
+                        "name": "Bash",
+                        "description": "Run a command",
+                        "input_schema": {"type": "object"},
+                    }],
+                },
+            )
+        assert resp.status_code == 200
+        assert passthrough_stub.await_count == 1
+        called_body, called_stream = passthrough_stub.await_args.args
+        assert called_stream is True
+        assert called_body["model"] == "claude-sonnet-4-6"
+        assert called_body["tools"][0]["name"] == "Bash"
+        # Verify the response contains the streaming SSE content.
+        body_text = resp.text
+        assert "event: message_start" in body_text
+        assert "event: content_block_start" in body_text
+        assert "tool_use" in body_text
+        assert "event: message_stop" in body_text
+
+    def test_route_b_claude_passthrough_auth_not_ready(self, test_client, proxy_module):
+        """Route B returns 503 when Claude auth isn't ready."""
+        from fastapi import HTTPException
+
+        async def _passthrough_raises(body, stream):
+            raise HTTPException(status_code=503, detail="Claude auth not ready")
+
+        mock_auth = MagicMock(is_ready=False)
+        with patch.object(proxy_module, "auth", mock_auth), \
+             patch.object(proxy_module, "call_claude_messages_passthrough",
+                          side_effect=_passthrough_raises):
+            resp = test_client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 100,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{
+                        "name": "Bash",
+                        "description": "Run a command",
+                        "input_schema": {"type": "object"},
+                    }],
+                },
+            )
+        assert resp.status_code == 503
