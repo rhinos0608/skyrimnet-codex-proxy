@@ -18,9 +18,9 @@ Optimizations:
 """
 
 import asyncio
-import base64
 import contextvars
 import gc
+import html
 import json
 import random
 import time
@@ -28,15 +28,13 @@ import uuid
 import logging
 import shutil
 import os
+import threading
 import sys
-import tempfile
 import statistics
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import Optional, Union
+from typing import Optional
 from datetime import datetime, timedelta
-
-from cryptography.fernet import Fernet
 
 # Raise gen0 threshold to reduce stop-the-world pause frequency.
 # Short-lived request objects die before gen0 reaches 10k, so this
@@ -47,7 +45,6 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel
 from aiohttp import web
 import aiohttp
 
@@ -468,14 +465,26 @@ _round_robin_counter: int = 0
 reasoning_rewrite_enabled: bool = _cfg.get("reasoning_rewrite_enabled", False)
 logger.info(f"Reasoning rewrite: {'enabled' if reasoning_rewrite_enabled else 'disabled'}")
 
+# MCP mode flag — set True when running as an MCP tool server (python proxy.py --mode mcp).
+# In MCP mode, reasoning/thinking is left enabled by default, SSE scrubbing is bypassed,
+# and the reasoning→NPC-dialogue rewrite is disabled — MCP callers are general-purpose
+# agents, not SkyrimNet game NPCs.
+#
+# Known limitation: OAI-compatible providers (OpenRouter, Z.AI, OpenCode, Qwen, Xiaomi,
+# Ollama, NVIDIA) still strip ``thinking``/``reasoning`` from payloads in MCP mode because
+# those upstream APIs reject unknown params with 400 errors. Claude (Anthropic native path),
+# Antigravity, and Gemini CLI fully preserve reasoning/thought blocks in MCP mode.
+MCP_MODE: bool = False
+
 # Contextvar for per-request rewrite context (set in streaming path, read by passthrough_sse wrapper)
 _rewrite_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("rewrite_ctx", default={})
 
 
 def _passthrough_sse_dispatch(resp, request_id, provider_name, start, **kw):
-    """Dispatch to rewrite-aware passthrough when rewrite context is set, otherwise original."""
+    """Dispatch to rewrite-aware passthrough when rewrite context is set, otherwise original.
+    In MCP mode, always use the original passthrough (no NPC dialogue rewrite)."""
     ctx = _rewrite_ctx.get()
-    if reasoning_rewrite_enabled and ctx:
+    if not MCP_MODE and reasoning_rewrite_enabled and ctx:
         return passthrough_sse_with_rewrite(
             resp, request_id, provider_name, start,
             system_prompt=ctx.get("system_prompt"),
@@ -613,6 +622,12 @@ class ModelStatsTracker:
             return None
         candidates.sort(key=lambda x: -x[1])
         return candidates[0][0]
+
+# Lock protecting stats snapshots for disk persistence.  Only _save_stats_to_disk()
+# runs off the event loop (via asyncio.to_thread), so wrapping to_dict() there
+# is sufficient — record() methods run on the event loop and perform only
+# atomic dict/deque operations under CPython's GIL.
+_stats_lock = threading.Lock()
 
 model_stats = ModelStatsTracker()
 
@@ -780,12 +795,14 @@ def _load_stats_from_disk() -> None:
 
 def _save_stats_to_disk() -> None:
     """Atomically write current stats to STATS_FILE (tmp + rename)."""
-    payload = {
-        "version": _STATS_FILE_VERSION,
-        "saved_at": time.time(),
-        "model_stats": model_stats.to_dict(),
-        "request_stats": request_stats.to_dict(),
-    }
+    with _stats_lock:
+        payload = {
+            "version": _STATS_FILE_VERSION,
+            "saved_at": time.time(),
+            "model_stats": model_stats.to_dict(),
+            "request_stats": request_stats.to_dict(),
+        }
+    # File I/O can happen outside the lock since payload is a snapshot.
     tmp_path = STATS_FILE + ".tmp"
     try:
         with open(tmp_path, "w") as f:
@@ -1234,19 +1251,7 @@ async def _with_timeout_routing(
         pre_content_chunks.append(chunk)
 
         # Detect first non-empty content chunk to mark TTFT
-        # Cheap string check guards the expensive json.loads — role/done chunks don't contain '"content"'
-        has_content = False
-        try:
-            if (isinstance(chunk, str) and chunk.startswith("data: ")
-                    and "[DONE]" not in chunk and '"content"' in chunk):
-                data = json.loads(chunk[6:])
-                delta = data.get("choices", [{}])[0].get("delta", {})
-                if delta.get("content"):
-                    has_content = True
-        except Exception:
-            pass
-
-        if has_content:
+        if _chunk_has_content(chunk):
             model_stats.record(model, time.time() - start, success=True)
             break
 
@@ -1409,7 +1414,17 @@ async def lifespan(app):
         await codex_runner.cleanup()
 
 app = FastAPI(title="Claude SkyrimNet Proxy", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8539",
+        "http://127.0.0.1:8539",
+        "http://localhost:8432",
+        "http://127.0.0.1:8432",
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"])
 
 # --- Register route modules (Phase 5) ---
 from proxy_internal.endpoints.health import router as _health_router
@@ -1525,7 +1540,11 @@ async def _chat_completions_inner(req: ChatRequest):
     else:
         _caller_thinking = extra_params.get("thinking")
         if _caller_thinking is None:
-            extra_params.setdefault("thinking", {"type": "disabled"})
+            # In MCP mode, leave thinking unset so providers use their defaults
+            # (reasoning enabled). Only force-disabled in proxy mode where
+            # reasoning tokens get scrubbed and produce empty NPC responses.
+            if not MCP_MODE:
+                extra_params.setdefault("thinking", {"type": "disabled"})
 
     def _stream(gen):
         """Wrap a streaming generator with timeout routing if enabled."""
@@ -1610,12 +1629,14 @@ async def _chat_completions_inner(req: ChatRequest):
 
     if req.stream:
         async def _stream_with_rewrite_context():
-            token = _rewrite_ctx.set({"system_prompt": system_prompt, "model": model})
+            # Only set rewrite context in proxy mode — MCP mode skips the rewrite entirely.
+            token = _rewrite_ctx.set({"system_prompt": system_prompt, "model": model}) if not MCP_MODE else None
             try:
                 async for chunk in _tracked_stream(_stream(stream_fn(call_system_prompt, call_messages, model, max_tokens, **kwargs))):
                     yield chunk
             finally:
-                _rewrite_ctx.reset(token)
+                if token is not None:
+                    _rewrite_ctx.reset(token)
         return StreamingResponse(
             _stream_with_rewrite_context(),
             media_type="text/event-stream",
@@ -2905,6 +2926,14 @@ _oauth_states: dict[str, dict] = {}
 _oauth_callback_server = None
 
 
+def _cleanup_expired_oauth_states():
+    """Remove OAuth state entries older than 10 minutes."""
+    now = time.time()
+    expired = [k for k, v in _oauth_states.items() if now - v.get("created_at", 0) > 600]
+    for k in expired:
+        _oauth_states.pop(k, None)
+
+
 async def start_oauth_callback_server():
     """Start a temporary server on port 51121 to handle OAuth callbacks."""
     global _oauth_callback_server
@@ -2912,18 +2941,21 @@ async def start_oauth_callback_server():
     async def callback_handler(request):
         global antigravity_auth
 
+        _cleanup_expired_oauth_states()
+
         code = request.query.get("code", "")
         state = request.query.get("state", "")
         error = request.query.get("error", "")
 
         if error:
-            html = f"""<!DOCTYPE html>
+            safe_error = html.escape(error)
+            html_content = f"""<!DOCTYPE html>
 <html><head><title>OAuth Error</title><style>
 body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; max-width:600px; margin:60px auto; padding:20px; text-align:center }}
 h1 {{ color:#f87171 }}</style></head>
-<body><h1>❌ Authentication Failed</h1><p>Error: {error}</p>
+<body><h1>❌ Authentication Failed</h1><p>Error: {safe_error}</p>
 <a href="http://localhost:8539/config/antigravity-login">Try again</a></body></html>"""
-            return web.Response(text=html, content_type="text/html")
+            return web.Response(text=html_content, content_type="text/html")
 
         if not code or not state:
             return web.Response(text="<h1>Missing code or state</h1>", status_code=400, content_type="text/html")
@@ -2952,8 +2984,8 @@ h1 {{ color:#f87171 }}</style></head>
                 ) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
-                        html = f"<h1>Token exchange failed: {error_text}</h1>"
-                        return web.Response(text=html, status_code=400, content_type="text/html")
+                        html_content = f"<h1>Token exchange failed: {html.escape(error_text)}</h1>"
+                        return web.Response(text=html_content, status_code=400, content_type="text/html")
 
                     token_data = await resp.json()
 
@@ -3001,7 +3033,7 @@ h1 {{ color:#f87171 }}</style></head>
             accounts_text = f"({account_count} account{'s' if account_count != 1 else ''} configured)"
 
             # Return success page with redirect
-            html = f"""<!DOCTYPE html>
+            html_content = f"""<!DOCTYPE html>
 <html><head><title>Login Success</title>
 <style>
 body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; max-width:600px; margin:60px auto; padding:20px; text-align:center }}
@@ -3014,18 +3046,18 @@ h1 {{ color:#4ade80 }}
 <body>
 <h1>✅ Authentication Successful</h1>
 <div class="info">
-<div style="margin-bottom:8px"><span class="label">Email:</span> <span class="value">{new_account.email}</span></div>
-<div style="margin-bottom:8px"><span class="label">Project ID:</span> <span class="value">{new_account.project_id}</span></div>
+<div style="margin-bottom:8px"><span class="label">Email:</span> <span class="value">{html.escape(new_account.email or '')}</span></div>
+<div style="margin-bottom:8px"><span class="label">Project ID:</span> <span class="value">{html.escape(str(new_account.project_id or ''))}</span></div>
 </div>
 <div class="accounts">{accounts_text}</div>
 <p>Redirecting to dashboard in 3 seconds...</p>
 <script>setTimeout(function() {{ window.location.href = 'http://localhost:8539/'; }}, 3000);</script>
 </body></html>"""
-            return web.Response(text=html, content_type="text/html")
+            return web.Response(text=html_content, content_type="text/html")
 
         except Exception as e:
             logger.error(f"Antigravity OAuth error: {e}")
-            return web.Response(text=f"<h1>Error: {e}</h1>", status_code=500, content_type="text/html")
+            return web.Response(text=f"<h1>Error: {html.escape(str(e))}</h1>", status_code=500, content_type="text/html")
 
     app = web.Application()
     app.router.add_get("/oauth-callback", callback_handler)
@@ -3144,6 +3176,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.mode == "mcp":
+        proxy_module = sys.modules[__name__]
+        proxy_module.MCP_MODE = True
         from mcp_server import run_mcp_server
         if args.tailscale and args.transport == "sse":
             _setup_tailscale_serve([8432])

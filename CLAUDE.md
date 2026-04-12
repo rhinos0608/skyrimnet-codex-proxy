@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OpenAI-compatible API proxy that routes `/v1/chat/completions` requests through multiple LLM providers (Claude, Codex, OpenRouter, Ollama, Antigravity, Gemini CLI, Z.AI, OpenCode, Qwen Code) to power AI-driven NPC conversations in [SkyrimNet](https://github.com/MinLL/SkyrimNet-GamePlugin). Single-file FastAPI app (`proxy.py`, ~5000 lines) running on port 8000.
+OpenAI-compatible API proxy that routes `/v1/chat/completions` requests through multiple LLM providers (Claude, Codex, OpenRouter, Ollama, Antigravity, Gemini CLI, Z.AI, OpenCode, Qwen Code) to power AI-driven NPC conversations in [SkyrimNet](https://github.com/MinLL/SkyrimNet-GamePlugin). Single-file FastAPI app (`proxy.py`, ~3200 lines) running on port 8000.
 
 ## Commands
 

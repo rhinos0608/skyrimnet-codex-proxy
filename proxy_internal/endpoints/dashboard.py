@@ -1,4 +1,5 @@
 """Dashboard route handler."""
+import html
 import os
 
 from fastapi import APIRouter
@@ -99,6 +100,9 @@ async def dashboard():
     if ag_accounts:
         ag_accounts_html = "<div style='margin-top:8px;font-size:0.85rem'>"
         for acc in ag_accounts:
+            safe_email = html.escape(acc['email'])
+            # For JS string context, also escape backslashes and quotes
+            js_safe_email = safe_email.replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\"')
             status_icon = "✓" if acc["is_ready"] else "⚠"
             status_color_acc = "#4ade80" if acc["is_ready"] else "#facc15"
             error_badge = (
@@ -106,12 +110,12 @@ async def dashboard():
                 if acc.get("error_count", 0) > 0 else ""
             )
             remove_link = (
-                f"<a href='#' onclick='removeAccount(\"{acc['email']}\");return false' "
+                f"<a href='#' onclick='removeAccount(\"{js_safe_email}\");return false' "
                 f"style='color:#f87171;margin-left:8px;font-size:0.75rem'>[remove]</a>"
             )
             ag_accounts_html += (
                 f"<div style='margin:4px 0'><span style='color:{status_color_acc}'>{status_icon}</span> "
-                f"{acc['email']}{error_badge}{remove_link}</div>"
+                f"{safe_email}{error_badge}{remove_link}</div>"
             )
         ag_accounts_html += "</div>"
     else:

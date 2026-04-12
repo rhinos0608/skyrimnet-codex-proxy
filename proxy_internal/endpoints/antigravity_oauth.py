@@ -1,8 +1,10 @@
 """Antigravity OAuth login + account management endpoints."""
 import base64
 import hashlib
+import html
 import logging
 import secrets
+import time
 from urllib.parse import unquote
 
 from fastapi import APIRouter
@@ -23,7 +25,7 @@ async def antigravity_login(project_id: str = ""):
             await proxy.start_oauth_callback_server()
         except Exception as e:
             logger.error(f"Failed to start OAuth callback server: {e}")
-            return HTMLResponse(content=f"<h1>Failed to start OAuth callback server: {e}</h1>", status_code=500)
+            return HTMLResponse(content=f"<h1>Failed to start OAuth callback server: {html.escape(str(e))}</h1>", status_code=500)
 
     # Generate PKCE verifier and challenge
     verifier = secrets.token_urlsafe(96)
@@ -33,9 +35,11 @@ async def antigravity_login(project_id: str = ""):
 
     # Store state
     state = secrets.token_urlsafe(16)
+    proxy._cleanup_expired_oauth_states()
     proxy._oauth_states[state] = {
         "verifier": verifier,
         "project_id": project_id,
+        "created_at": time.time(),
     }
 
     # Build authorization URL
