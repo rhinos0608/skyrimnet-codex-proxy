@@ -72,7 +72,9 @@ def _resolve_nvidia_model(model: str) -> str:
     return _NVIDIA_MODEL_ALIASES.get(raw, raw)
 
 
-_NVIDIA_UNSUPPORTED_PARAMS = {"reasoning", "top_k", "provider"}
+_NVIDIA_UNSUPPORTED_PARAMS = {"reasoning", "thinking", "top_k", "provider"}
+
+_reasoning_strip_warned = False
 
 
 def _nvidia_payload_fixup(payload: dict, extra_params: dict) -> None:
@@ -80,6 +82,14 @@ def _nvidia_payload_fixup(payload: dict, extra_params: dict) -> None:
 
     - Strips unsupported params (reasoning, top_k, provider).
     """
+    import proxy
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for NVIDIA NIM "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
     payload.update({k: v for k, v in extra_params.items()
                     if v is not None and k not in _NVIDIA_UNSUPPORTED_PARAMS})
 

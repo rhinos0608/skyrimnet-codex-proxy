@@ -19,6 +19,8 @@ from proxy_internal.sse_utils import make_sse_content_chunk, yield_sse_error
 
 logger = logging.getLogger("proxy")
 
+_reasoning_strip_warned = False
+
 
 def _zai_supports_vision(api_model: str) -> bool:
     """Z.AI vision models contain 'v' as a suffix/segment (e.g. glm-5v-turbo, glm-4.6v)."""
@@ -44,7 +46,15 @@ async def call_zai_direct(system_prompt: Optional[str], messages: list, model: s
     strip = not _zai_supports_vision(api_model)
 
     payload = {"model": api_model, "messages": build_oai_messages(system_prompt, messages, strip_vision=strip), "max_tokens": max_tokens}
-    payload.update({k: v for k, v in extra_params.items() if v is not None})
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for Z.AI "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
+    payload.update({k: v for k, v in extra_params.items()
+                    if v is not None and k not in ("thinking", "reasoning")})
 
     request_id = uuid.uuid4().hex[:8]
     logger.info(f"[{request_id}] -> Z.AI ({api_model}, {len(messages)} msgs)")
@@ -113,7 +123,15 @@ async def call_zai_streaming(system_prompt: Optional[str], messages: list, model
 
     # Omit max_tokens for streaming — reasoning models (GLM) exhaust it on chain-of-thought
     payload = {"model": api_model, "messages": build_oai_messages(system_prompt, messages, strip_vision=strip), "stream": True}
-    payload.update({k: v for k, v in extra_params.items() if v is not None})
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for Z.AI "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
+    payload.update({k: v for k, v in extra_params.items()
+                    if v is not None and k not in ("thinking", "reasoning")})
 
     request_id = uuid.uuid4().hex[:8]
     logger.info(f"[{request_id}] -> Z.AI ({api_model}, {len(messages)} msgs, stream)")

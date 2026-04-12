@@ -18,6 +18,8 @@ from proxy_internal.sse_utils import yield_sse_error
 
 logger = logging.getLogger("proxy")
 
+_reasoning_strip_warned = False
+
 
 def _resolve_opencode(model: str):
     """Resolve OpenCode model prefix to (api_model, base_url, api_key, plan_name).
@@ -42,7 +44,15 @@ async def call_opencode_direct(system_prompt: Optional[str], messages: list, mod
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": "opencode/1.3.10"}
 
     payload = {"model": api_model, "messages": build_oai_messages(system_prompt, messages), "max_tokens": max_tokens}
-    payload.update({k: v for k, v in extra_params.items() if v is not None})
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for OpenCode "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
+    payload.update({k: v for k, v in extra_params.items()
+                    if v is not None and k not in ("thinking", "reasoning")})
 
     request_id = uuid.uuid4().hex[:8]
     logger.info(f"[{request_id}] -> OpenCode ({api_model}, {len(messages)} msgs)")
@@ -107,7 +117,16 @@ async def call_opencode_streaming(system_prompt: Optional[str], messages: list, 
 
     # Omit max_tokens for streaming — reasoning models exhaust it on chain-of-thought
     payload = {"model": api_model, "messages": build_oai_messages(system_prompt, messages), "stream": True}
-    payload.update({k: v for k, v in extra_params.items() if v is not None})
+    # OpenCode proxies to various backends — strip thinking/reasoning to avoid errors.
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for OpenCode "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
+    payload.update({k: v for k, v in extra_params.items()
+                    if v is not None and k not in ("thinking", "reasoning")})
 
     request_id = uuid.uuid4().hex[:8]
     logger.info(f"[{request_id}] -> OpenCode ({api_model}, {len(messages)} msgs, stream)")
@@ -129,9 +148,13 @@ async def call_opencode_streaming(system_prompt: Optional[str], messages: list, 
             return
 
         try:
+            saw_done = False
             async for event in proxy.passthrough_sse(resp, request_id, "OpenCode", start):
+                if event.strip().startswith("data: [DONE]"):
+                    saw_done = True
                 yield event
-            yield "data: [DONE]\n\n"
+            if not saw_done:
+                yield "data: [DONE]\n\n"
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             logger.error(f"[{request_id}] OpenCode streaming error: {e}")
             err, done = yield_sse_error(model, f"[OpenCode Error: {e}]")

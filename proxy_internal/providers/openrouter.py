@@ -14,6 +14,8 @@ from proxy_internal.sse_utils import yield_sse_error
 
 logger = logging.getLogger("proxy")
 
+_reasoning_strip_warned = False
+
 
 async def call_openrouter_direct(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params) -> str:
     """Forward request to OpenRouter (OpenAI-compatible), collect full response."""
@@ -22,7 +24,15 @@ async def call_openrouter_direct(system_prompt: Optional[str], messages: list, m
         raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
 
     payload = {"model": model, "messages": build_oai_messages(system_prompt, messages), "max_tokens": max_tokens}
-    payload.update({k: v for k, v in extra_params.items() if v is not None})
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for OpenRouter "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
+    payload.update({k: v for k, v in extra_params.items()
+                    if v is not None and k not in ("thinking", "reasoning")})
     headers = {"Authorization": f"Bearer {proxy.openrouter_api_key}", "Content-Type": "application/json"}
 
     request_id = uuid.uuid4().hex[:8]
@@ -78,7 +88,17 @@ async def call_openrouter_streaming(system_prompt: Optional[str], messages: list
         return
 
     payload = {"model": model, "messages": build_oai_messages(system_prompt, messages), "max_tokens": max_tokens, "stream": True}
-    payload.update({k: v for k, v in extra_params.items() if v is not None})
+    # OpenRouter proxies to many upstreams — most don't understand thinking/reasoning.
+    # Strip them to avoid 400 errors; response-side scrubbing handles any reasoning tokens.
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for OpenRouter "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
+    payload.update({k: v for k, v in extra_params.items()
+                    if v is not None and k not in ("thinking", "reasoning")})
     headers = {"Authorization": f"Bearer {proxy.openrouter_api_key}", "Content-Type": "application/json"}
 
     request_id = uuid.uuid4().hex[:8]
@@ -105,8 +125,13 @@ async def call_openrouter_streaming(system_prompt: Optional[str], messages: list
 
         try:
             # OpenRouter returns OpenAI-format SSE — passthrough directly
+            saw_done = False
             async for event in proxy.passthrough_sse(resp, request_id, "OpenRouter", start):
+                if event.strip().startswith("data: [DONE]"):
+                    saw_done = True
                 yield event
+            if not saw_done:
+                yield "data: [DONE]\n\n"
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             logger.error(f"[{request_id}] OpenRouter streaming error: {e}")
             err, done = yield_sse_error(model, f"[OpenRouter Error: {e}]")

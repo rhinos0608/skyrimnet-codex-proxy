@@ -17,6 +17,8 @@ from proxy_internal.sse_utils import yield_sse_error
 
 logger = logging.getLogger("proxy")
 
+_reasoning_strip_warned = False
+
 
 async def call_qwen_direct(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params) -> str:
     """Forward request to Qwen (OpenAI-compatible), collect full response."""
@@ -30,7 +32,15 @@ async def call_qwen_direct(system_prompt: Optional[str], messages: list, model: 
     endpoint = f"{proxy.QWEN_BASE_URL}/chat/completions"
 
     payload = {"model": api_model, "messages": build_oai_messages(system_prompt, messages)}
-    payload.update({k: v for k, v in extra_params.items() if v is not None})
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for Qwen "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
+    payload.update({k: v for k, v in extra_params.items()
+                    if v is not None and k not in ("thinking", "reasoning")})
 
     request_id = uuid.uuid4().hex[:8]
     logger.info(f"[{request_id}] -> Qwen ({api_model}, {len(messages)} msgs)")
@@ -99,7 +109,15 @@ async def call_qwen_streaming(system_prompt: Optional[str], messages: list, mode
     headers = proxy.qwen_auth.get_auth_headers()
 
     payload = {"model": api_model, "messages": build_oai_messages(system_prompt, messages), "stream": True}
-    payload.update({k: v for k, v in extra_params.items() if v is not None})
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for Qwen "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
+    payload.update({k: v for k, v in extra_params.items()
+                    if v is not None and k not in ("thinking", "reasoning")})
 
     request_id = uuid.uuid4().hex[:8]
     logger.info(f"[{request_id}] -> Qwen ({api_model}, {len(messages)} msgs, stream)")
@@ -122,9 +140,13 @@ async def call_qwen_streaming(system_prompt: Optional[str], messages: list, mode
                 try:
                     async with session.post(endpoint, json=payload, headers=retry_headers) as retry_resp:
                         if retry_resp.status == 200:
+                            saw_done = False
                             async for event in proxy.passthrough_sse(retry_resp, request_id, "Qwen", start):
+                                if event.strip().startswith("data: [DONE]"):
+                                    saw_done = True
                                 yield event
-                            yield "data: [DONE]\n\n"
+                            if not saw_done:
+                                yield "data: [DONE]\n\n"
                             return
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
                     pass
@@ -136,9 +158,13 @@ async def call_qwen_streaming(system_prompt: Optional[str], messages: list, mode
             return
 
         try:
+            saw_done = False
             async for event in proxy.passthrough_sse(resp, request_id, "Qwen", start):
+                if event.strip().startswith("data: [DONE]"):
+                    saw_done = True
                 yield event
-            yield "data: [DONE]\n\n"
+            if not saw_done:
+                yield "data: [DONE]\n\n"
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             logger.error(f"[{request_id}] Qwen streaming error: {e}")
             err, done = yield_sse_error(model, f"[Qwen Error: {e}]")

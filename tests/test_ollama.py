@@ -246,6 +246,30 @@ async def test_call_ollama_direct_retries_reasoning_only_stop_without_max_tokens
 
 
 @pytest.mark.asyncio
+async def test_call_ollama_streaming_appends_done_when_passthrough_omits_it(proxy_module):
+    """Ollama streaming should add a clean terminator if passthrough does not."""
+    mock_resp = _make_mock_response(200, {})
+    session = _make_mock_session(mock_resp)
+
+    async def fake_passthrough(*args, **kwargs):
+        yield 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+
+    with patch.object(proxy_module, "ollama_api_key", None), \
+         patch.object(proxy_module, "auth", MagicMock(session=None)), \
+         patch.object(proxy_module, "create_session", return_value=session), \
+         patch.object(proxy_module, "_open_stream_with_retry", new_callable=AsyncMock, return_value=(mock_resp, mock_resp)), \
+         patch.object(proxy_module, "passthrough_sse", side_effect=fake_passthrough):
+        chunks = []
+        async for chunk in proxy_module.call_ollama_streaming(
+            None, [{"role": "user", "content": "hi"}], "ollama:llama3.2", 100
+        ):
+            chunks.append(chunk)
+
+    assert chunks[-1] == "data: [DONE]\n\n"
+    assert "".join(chunks).count("[DONE]") == 1
+
+
+@pytest.mark.asyncio
 async def test_call_ollama_direct_unreachable_raises_503(proxy_module):
     """ClientConnectorError -> HTTPException 503."""
     import aiohttp
@@ -344,7 +368,9 @@ async def test_call_ollama_streaming_strips_unsupported_top_k(proxy_module):
     combined = "".join(chunks)
     payload = session.post.call_args[1]["json"]
     assert "hello" in combined
-    assert payload["reasoning"] == {"effort": "low"}
+    # Both reasoning and thinking are stripped — Ollama doesn't support them
+    assert "reasoning" not in payload
+    assert "thinking" not in payload
     assert "top_k" not in payload
 
 

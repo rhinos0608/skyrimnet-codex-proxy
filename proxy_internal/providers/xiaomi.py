@@ -18,6 +18,8 @@ from proxy_internal.sse_utils import yield_sse_error
 
 logger = logging.getLogger("proxy")
 
+_reasoning_strip_warned = False
+
 
 async def call_xiaomi_direct(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params) -> str:
     """Forward request to Xiaomi (OpenAI-compatible), collect full response."""
@@ -30,7 +32,15 @@ async def call_xiaomi_direct(system_prompt: Optional[str], messages: list, model
     headers = {"Authorization": f"Bearer {proxy.xiaomi_api_key}", "Content-Type": "application/json"}
 
     payload = {"model": api_model, "messages": build_oai_messages(system_prompt, messages), "max_tokens": max_tokens}
-    payload.update({k: v for k, v in extra_params.items() if v is not None})
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for Xiaomi "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
+    payload.update({k: v for k, v in extra_params.items()
+                    if v is not None and k not in ("thinking", "reasoning")})
 
     request_id = uuid.uuid4().hex[:8]
     logger.info(f"[{request_id}] -> Xiaomi ({api_model}, {len(messages)} msgs)")
@@ -100,7 +110,15 @@ async def call_xiaomi_streaming(system_prompt: Optional[str], messages: list, mo
     # Omit max_tokens for streaming — reasoning models exhaust it on chain-of-thought,
     # producing empty content.  NPC dialogue is naturally short.
     payload = {"model": api_model, "messages": build_oai_messages(system_prompt, messages), "stream": True}
-    payload.update({k: v for k, v in extra_params.items() if v is not None})
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for Xiaomi "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
+    payload.update({k: v for k, v in extra_params.items()
+                    if v is not None and k not in ("thinking", "reasoning")})
 
     request_id = uuid.uuid4().hex[:8]
     logger.info(f"[{request_id}] -> Xiaomi ({api_model}, {len(messages)} msgs, stream)")
@@ -122,9 +140,13 @@ async def call_xiaomi_streaming(system_prompt: Optional[str], messages: list, mo
             return
 
         try:
+            saw_done = False
             async for event in proxy.passthrough_sse(resp, request_id, "Xiaomi", start):
+                if event.strip().startswith("data: [DONE]"):
+                    saw_done = True
                 yield event
-            yield "data: [DONE]\n\n"
+            if not saw_done:
+                yield "data: [DONE]\n\n"
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             logger.error(f"[{request_id}] Xiaomi streaming error: {e}")
             err, done = yield_sse_error(model, f"[Xiaomi Error: {e}]")

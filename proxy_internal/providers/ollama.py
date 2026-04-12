@@ -20,11 +20,27 @@ from proxy_internal.sse_utils import yield_sse_error
 logger = logging.getLogger("proxy")
 
 
-_OLLAMA_UNSUPPORTED_PARAMS = {"top_k"}
+_OLLAMA_UNSUPPORTED_PARAMS = {"top_k", "thinking", "reasoning"}
+
+_reasoning_strip_warned = False
 
 
 def _ollama_payload_fixup(payload: dict, extra_params: dict) -> None:
-    """Apply Ollama-specific payload adjustments for OpenAI-compatible calls."""
+    """Apply Ollama-specific payload adjustments for OpenAI-compatible calls.
+
+    Ollama's /v1 API does not support the thinking/reasoning params — they
+    cause 400 errors on models that don't recognise them.  Strip them here;
+    response-side scrubbing in passthrough_sse handles any reasoning tokens
+    that still appear in the stream.
+    """
+    import proxy
+    global _reasoning_strip_warned
+    if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
+        _reasoning_strip_warned = True
+        logger.info(
+            "Reasoning override active — 'thinking' param stripped for Ollama "
+            "(upstream does not support it); 'reasoning_effort' forwarded"
+        )
     payload.update({
         k: v for k, v in extra_params.items()
         if v is not None and k not in _OLLAMA_UNSUPPORTED_PARAMS
@@ -151,8 +167,13 @@ async def call_ollama_streaming(system_prompt: Optional[str], messages: list, mo
 
         try:
             # Ollama /v1 returns OpenAI-format SSE — passthrough directly
+            saw_done = False
             async for event in proxy.passthrough_sse(resp, request_id, "Ollama", start):
+                if event.strip().startswith("data: [DONE]"):
+                    saw_done = True
                 yield event
+            if not saw_done:
+                yield "data: [DONE]\n\n"
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             logger.error(f"[{request_id}] Ollama streaming error: {e}")
             err, done = yield_sse_error(model, f"[Ollama Error: {e}]")

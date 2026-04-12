@@ -242,6 +242,30 @@ async def test_openrouter_streaming_error_status_yields_error_and_done(proxy_mod
     assert "OpenRouter Error 500" in combined
 
 
+@pytest.mark.asyncio
+async def test_openrouter_streaming_appends_done_when_passthrough_omits_it(proxy_module):
+    """Provider should terminate cleanly even if passthrough emitted no [DONE]."""
+    mock_resp = _make_streaming_response(200, [])
+    session = _make_mock_session(mock_resp)
+
+    async def fake_passthrough(*args, **kwargs):
+        yield 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+
+    with patch.object(proxy_module, "openrouter_api_key", "sk-test"), \
+         patch.object(proxy_module, "auth", MagicMock(session=None)), \
+         patch.object(proxy_module, "create_session", return_value=session), \
+         patch.object(proxy_module, "_open_stream_with_retry", new_callable=AsyncMock, return_value=(mock_resp, mock_resp)), \
+         patch.object(proxy_module, "passthrough_sse", side_effect=fake_passthrough):
+        chunks = []
+        async for chunk in proxy_module.call_openrouter_streaming(
+            None, [{"role": "user", "content": "hi"}], "openai/gpt-4o", 100
+        ):
+            chunks.append(chunk)
+
+    assert chunks[-1] == "data: [DONE]\n\n"
+    assert "".join(chunks).count("[DONE]") == 1
+
+
 # ---------------------------------------------------------------------------
 # Codex CLI (call_codex_direct)
 # ---------------------------------------------------------------------------
