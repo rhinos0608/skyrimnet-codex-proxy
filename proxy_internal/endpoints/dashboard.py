@@ -229,6 +229,19 @@ async def dashboard():
     timeout_routing_color = "#4ade80" if proxy.timeout_routing_enabled else "#64748b"
     timeout_routing_label = "Active" if proxy.timeout_routing_enabled else "Disabled"
 
+    reasoning_override_enabled = bool(proxy.reasoning_override_enabled)
+    reasoning_override_level = proxy.reasoning_override_level
+    reasoning_override_checked = "checked" if reasoning_override_enabled else ""
+    reasoning_override_color = "#4ade80" if reasoning_override_enabled else "#64748b"
+    reasoning_override_label = (
+        f"Active ({reasoning_override_level})" if reasoning_override_enabled else "Disabled"
+    )
+    reasoning_override_badge = (
+        f'<span class="status" style="background:#a78bfa20;color:#a78bfa;'
+        f'border:1px solid #a78bfa40;margin-left:8px">🧠 Reasoning: {reasoning_override_level}</span>'
+        if reasoning_override_enabled else ""
+    )
+
     ctx = DashboardContext(
         status=status,
         status_color=status_color,
@@ -283,5 +296,15 @@ async def dashboard():
         timeout_routing_checked=timeout_routing_checked,
         timeout_routing_color=timeout_routing_color,
         timeout_routing_label=timeout_routing_label,
+        reasoning_override_enabled=reasoning_override_enabled,
+        reasoning_override_level=reasoning_override_level,
+        reasoning_override_checked=reasoning_override_checked,
+        reasoning_override_color=reasoning_override_color,
+        reasoning_override_label=reasoning_override_label,
+        reasoning_override_badge=reasoning_override_badge,
+        reasoning_rewrite_enabled=bool(proxy.reasoning_rewrite_enabled),
+        reasoning_rewrite_checked="checked" if proxy.reasoning_rewrite_enabled else "",
+        reasoning_rewrite_color="#4ade80" if proxy.reasoning_rewrite_enabled else "#64748b",
+        reasoning_rewrite_label="Active" if proxy.reasoning_rewrite_enabled else "Disabled",
     )
     return render_dashboard(ctx)

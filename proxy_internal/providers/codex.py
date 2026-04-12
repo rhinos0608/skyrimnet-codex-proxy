@@ -103,12 +103,18 @@ def _cleanup_isolated_home(isolated_home: str) -> None:
 
 
 def _build_codex_exec_args(model: str) -> tuple[str, ...]:
-    """Return the Codex CLI argv with fast-mode overrides."""
+    """Return the Codex CLI argv with fast-mode overrides.
+
+    Reasoning effort is resolved via ``proxy._active_codex_reasoning_effort()``
+    so the dashboard reasoning override can lift Codex out of fast-mode without
+    re-plumbing kwargs through ``call_codex_streaming``.
+    """
     import proxy
+    effort = proxy._active_codex_reasoning_effort()
     return (
         "exec",
         "--model", model,
-        "-c", f'model_reasoning_effort="{proxy.CODEX_FAST_REASONING_EFFORT}"',
+        "-c", f'model_reasoning_effort="{effort}"',
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",

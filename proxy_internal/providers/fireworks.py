@@ -46,6 +46,9 @@ def _fireworks_payload_fixup(payload: dict, extra_params: dict) -> None:
     """
     payload.update({k: v for k, v in extra_params.items()
                     if v is not None and k not in _FIREWORKS_UNSUPPORTED_PARAMS})
+    thinking = extra_params.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+        payload["thinking"] = {"type": "disabled"}
     # Translate OpenAI-style reasoning param to Fireworks thinking param
     reasoning = extra_params.get("reasoning")
     if isinstance(reasoning, dict) and not reasoning.get("enabled", True):

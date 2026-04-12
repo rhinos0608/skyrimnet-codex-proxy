@@ -78,6 +78,22 @@ class DashboardContext:
     timeout_routing_color: str
     timeout_routing_label: str
 
+    # Reasoning override (forces thinking on regardless of caller input — used
+    # to rescue CCS-routed Claude Code sessions that land here with reasoning
+    # silently disabled).
+    reasoning_override_enabled: bool
+    reasoning_override_level: str
+    reasoning_override_checked: str
+    reasoning_override_color: str
+    reasoning_override_label: str
+    reasoning_override_badge: str
+
+    # Reasoning rewrite (secondary Fireworks call for reasoning-only responses)
+    reasoning_rewrite_enabled: bool
+    reasoning_rewrite_checked: str
+    reasoning_rewrite_color: str
+    reasoning_rewrite_label: str
+
 
 def render_dashboard(ctx: DashboardContext) -> str:
     """Render the dashboard HTML from pre-computed state."""
@@ -117,6 +133,7 @@ def render_dashboard(ctx: DashboardContext) -> str:
   <h1>Claude SkyrimNet Proxy</h1>
   <div class="subtitle">OpenAI-compatible proxy using Claude Max or Codex CLI subscription</div>
   <span class="status">{ctx.status}</span>
+  {ctx.reasoning_override_badge}
 
   <div class="card" style="border-color:#f87171;background:#450a0a20">
     <h3 style="margin:0 0 8px;font-size:1rem;color:#f87171">⚠️ Terms of Service Warning</h3>
@@ -473,6 +490,64 @@ def render_dashboard(ctx: DashboardContext) -> str:
         <button onclick="setMaxRetries()" style="margin-top:0;background:#334155;padding:4px 10px;font-size:0.8rem">Save</button>
       </label>
       <span id="maxRetriesStatus" style="color:#64748b;font-size:0.85rem;font-weight:600"></span>
+    </div>
+  </div>
+
+  <!-- Reasoning Override -->
+  <div class="card">
+    <h3 style="margin:0 0 8px; font-size:1rem; color:#f1f5f9">🧠 Reasoning Override</h3>
+    <p style="margin:0 0 10px;color:#94a3b8;font-size:0.85rem">
+      Forces thinking/reasoning ON at the chosen level, overriding per-request settings.
+      Useful for clients like CCS (Claude Code Switcher) whose per-tier reasoning defaults
+      never reach this proxy, leaving every request silently downgraded to <code>thinking=disabled</code>.
+    </p>
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap">
+      <label style="display:flex;gap:8px;align-items:center;cursor:pointer">
+        <input type="checkbox" id="reasoningOverrideToggle" {ctx.reasoning_override_checked}
+               onchange="setReasoningOverride(this.checked)"
+               style="width:16px;height:16px;cursor:pointer">
+        <span style="color:#f1f5f9;font-size:0.9rem">Force reasoning on</span>
+      </label>
+      <span id="reasoningOverrideStatus" style="color:{ctx.reasoning_override_color};font-size:0.85rem;font-weight:600">
+        {ctx.reasoning_override_label}
+      </span>
+      <label style="display:flex;gap:6px;align-items:center">
+        <span style="color:#94a3b8;font-size:0.85rem">Level:</span>
+        <select id="reasoningLevelSelect"
+                style="background:#1e293b;border:1px solid #334155;color:#f1f5f9;padding:4px 8px;border-radius:4px;font-size:0.85rem">
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+        </select>
+        <button onclick="setReasoningLevel()" style="margin-top:0;background:#334155;padding:4px 10px;font-size:0.8rem">Save</button>
+      </label>
+      <span id="reasoningLevelStatus" style="color:#64748b;font-size:0.85rem;font-weight:600"></span>
+    </div>
+    <script>
+      (function() {{
+        var sel = document.getElementById('reasoningLevelSelect');
+        if (sel) sel.value = "{ctx.reasoning_override_level}";
+      }})();
+    </script>
+  </div>
+
+  <!-- Reasoning Rewrite -->
+  <div class="card">
+    <h3 style="margin:0 0 8px; font-size:1rem; color:#f1f5f9">&#x1f504; Reasoning Rewrite</h3>
+    <p style="margin:0 0 10px;color:#94a3b8;font-size:0.85rem">
+      When enabled, if an upstream returns only reasoning tokens with no visible content,
+      the proxy rewrites the reasoning into NPC dialogue via Fireworks. Uses Fireworks API credits.
+    </p>
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap">
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer">
+        <input type="checkbox" id="reasoningRewriteToggle" {ctx.reasoning_rewrite_checked}
+               onchange="setReasoningRewrite(this.checked)"
+               style="accent-color:#f59e0b">
+        <span style="color:{ctx.reasoning_rewrite_color};font-size:0.85rem;font-weight:600">
+          {ctx.reasoning_rewrite_label}
+        </span>
+      </label>
+      <span id="reasoningRewriteStatus" style="color:#64748b;font-size:0.85rem;font-weight:600"></span>
     </div>
   </div>
 
@@ -1341,6 +1416,88 @@ async function setMaxRetries() {{
     }}
   }} catch(e) {{
     status.textContent = 'Error: ' + e.message;
+    status.style.color = '#f87171';
+  }}
+}}
+
+async function setReasoningOverride(enabled) {{
+  const status = document.getElementById('reasoningOverrideStatus');
+  try {{
+    const resp = await fetch('/config/reasoning-override', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{enabled}}),
+    }});
+    if (resp.ok) {{
+      const data = await resp.json();
+      status.textContent = data.reasoning_override_enabled ? 'Active (' + data.reasoning_override_level + ')' : 'Disabled';
+      status.style.color = data.reasoning_override_enabled ? '#4ade80' : '#64748b';
+    }} else {{
+      const err = await resp.json();
+      status.textContent = 'Error: ' + (err.detail || resp.status);
+      status.style.color = '#f87171';
+    }}
+  }} catch(e) {{
+    status.textContent = 'Error: ' + e.message;
+    status.style.color = '#f87171';
+  }}
+}}
+
+async function setReasoningLevel() {{
+  const sel = document.getElementById('reasoningLevelSelect');
+  const status = document.getElementById('reasoningLevelStatus');
+  const toggleStatus = document.getElementById('reasoningOverrideStatus');
+  const level = sel.value;
+  if (level !== 'low' && level !== 'medium' && level !== 'high') {{
+    status.textContent = 'Invalid level';
+    status.style.color = '#f87171';
+    return;
+  }}
+  try {{
+    const resp = await fetch('/config/reasoning-level', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{level}}),
+    }});
+    if (resp.ok) {{
+      const data = await resp.json();
+      status.textContent = 'Saved (' + data.reasoning_override_level + ')';
+      status.style.color = '#4ade80';
+      if (data.reasoning_override_enabled) {{
+        toggleStatus.textContent = 'Active (' + data.reasoning_override_level + ')';
+        toggleStatus.style.color = '#4ade80';
+      }}
+    }} else {{
+      const err = await resp.json();
+      status.textContent = 'Error: ' + (err.detail || resp.status);
+      status.style.color = '#f87171';
+    }}
+  }} catch(e) {{
+    status.textContent = 'Error: ' + e.message;
+    status.style.color = '#f87171';
+  }}
+}}
+
+async function setReasoningRewrite(enabled) {{
+  const status = document.getElementById('reasoningRewriteStatus');
+  try {{
+    const resp = await fetch('/config/reasoning-rewrite', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{enabled}}),
+    }});
+    if (resp.ok) {{
+      const data = await resp.json();
+      status.textContent = data.status === 'ok' ? '\u2713 Saved' : '\u2717 Error';
+      status.style.color = data.status === 'ok' ? '#4ade80' : '#f87171';
+      setTimeout(() => status.textContent = '', 2000);
+    }} else {{
+      const err = await resp.json();
+      status.textContent = '\u2717 ' + (err.detail || resp.status);
+      status.style.color = '#f87171';
+    }}
+  }} catch(e) {{
+    status.textContent = '\u2717 ' + e.message;
     status.style.color = '#f87171';
   }}
 }}
