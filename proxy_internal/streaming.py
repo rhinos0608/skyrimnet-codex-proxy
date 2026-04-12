@@ -109,8 +109,12 @@ async def passthrough_sse(resp, request_id: str, provider_name: str, start: floa
     """Passthrough OpenAI-format SSE from an upstream response, yielding events.
 
     Used by OpenRouter, Ollama, Z.AI, OpenCode, Qwen — all OpenAI-compatible SSE.
-    Strips reasoning fields from mixed chunks and drops reasoning-only chunks.
+    In proxy mode: strips reasoning fields from mixed chunks and drops reasoning-only chunks.
+    In MCP mode: passes events through verbatim (reasoning preserved for general-purpose callers).
     """
+    import proxy as _proxy
+    _mcp = getattr(_proxy, "MCP_MODE", False)
+
     buffer = bytearray()
     total_content = 0
     warned_reasoning_drop = False
@@ -123,7 +127,11 @@ async def passthrough_sse(resp, request_id: str, provider_name: str, start: floa
                 break
             event_bytes = bytes(buffer[:idx]).strip()
             del buffer[:idx + 2]
-            emitted, reasoning_text = _scrub_event(event_bytes)
+            if _mcp:
+                emitted = event_bytes.decode("utf-8", errors="replace").strip() + "\n\n" if event_bytes else None
+                reasoning_text = None
+            else:
+                emitted, reasoning_text = _scrub_event(event_bytes)
             if reasoning_text and not warned_reasoning_drop:
                 warned_reasoning_drop = True
                 logger.warning(f"[{request_id}] {provider_name} returned reasoning-only chunks, dropping hidden reasoning")
@@ -133,7 +141,12 @@ async def passthrough_sse(resp, request_id: str, provider_name: str, start: floa
             yield emitted
 
     if buffer.strip():
-        emitted, reasoning_text = _scrub_event(bytes(buffer).strip())
+        event_bytes = bytes(buffer).strip()
+        if _mcp:
+            emitted = event_bytes.decode("utf-8", errors="replace").strip() + "\n\n"
+            reasoning_text = None
+        else:
+            emitted, reasoning_text = _scrub_event(event_bytes)
         if reasoning_text and not warned_reasoning_drop:
             warned_reasoning_drop = True
             logger.warning(f"[{request_id}] {provider_name} returned reasoning-only chunks, dropping hidden reasoning")

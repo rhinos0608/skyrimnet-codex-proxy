@@ -66,15 +66,18 @@ def _get_antigravity_model_id(model: str) -> str:
 
 def _extract_antigravity_text(data: dict) -> str:
     """Extract text from Antigravity response."""
+    import proxy
     text_parts = []
     response = data.get("response", data)
     candidates = response.get("candidates", [])
+    _mcp = getattr(proxy, "MCP_MODE", False)
     for candidate in candidates:
         content = candidate.get("content", {})
         parts = content.get("parts", [])
         for part in parts:
-            # Skip thought blocks (they have thought: true or thoughtSignature)
-            if part.get("thought") or part.get("thoughtSignature"):
+            # Skip thought blocks in proxy mode (NPC callers don't see reasoning).
+            # In MCP mode, include thought text so general-purpose callers get reasoning.
+            if not _mcp and (part.get("thought") or part.get("thoughtSignature")):
                 continue
             text = part.get("text", "")
             if text:
@@ -210,6 +213,7 @@ async def call_antigravity_streaming(
 ):
     """Call Antigravity API with streaming and multi-account fallback on initial errors."""
     import proxy
+    _mcp = getattr(proxy, "MCP_MODE", False)
     # Retry policy: not wrapped — see _with_retry docstring.
     if not proxy.antigravity_auth.is_ready:
         await proxy.antigravity_auth.refresh_if_needed()
@@ -365,8 +369,8 @@ async def call_antigravity_streaming(
                             content = candidate.get("content", {})
                             parts = content.get("parts", [])
                             for part in parts:
-                                # Skip thought blocks
-                                if part.get("thought") or part.get("thoughtSignature"):
+                                # Skip thought blocks in proxy mode (MCP mode preserves reasoning)
+                                if not _mcp and (part.get("thought") or part.get("thoughtSignature")):
                                     continue
                                 text = part.get("text", "")
                                 if text:
@@ -394,7 +398,7 @@ async def call_antigravity_streaming(
                                 response = event.get("response", event)
                                 for candidate in response.get("candidates", []):
                                     for part in candidate.get("content", {}).get("parts", []):
-                                        if part.get("thought") or part.get("thoughtSignature"):
+                                        if not _mcp and (part.get("thought") or part.get("thoughtSignature")):
                                             continue
                                         text = part.get("text", "")
                                         if text:

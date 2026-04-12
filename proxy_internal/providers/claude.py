@@ -52,11 +52,12 @@ def _build_api_body(system_prompt: Optional[str], messages: list, model: str, ma
     body["model"] = model
     body["stream"] = True
     # When the dashboard reasoning override is active, inject the override
-    # thinking config. Otherwise strip thinking to prevent chain-of-thought
+    # thinking config. In proxy mode, strip thinking to prevent chain-of-thought
     # tokens that get scrubbed server-side, leaving 0-char responses.
+    # In MCP mode, leave thinking as-is so reasoning flows through.
     if proxy.reasoning_override_enabled:
         body["thinking"] = proxy._override_thinking_payload(max_tokens)
-    else:
+    elif not getattr(proxy, "MCP_MODE", False):
         body.pop("thinking", None)
     return body
 

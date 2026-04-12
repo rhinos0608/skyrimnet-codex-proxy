@@ -121,6 +121,7 @@ async def call_gemini_streaming(
 ):
     """Call Gemini API with SSE streaming."""
     import proxy
+    _mcp = getattr(proxy, "MCP_MODE", False)
     # Retry policy: not wrapped — see _with_retry docstring.
     if not proxy.gemini_auth.is_ready or proxy.gemini_auth.is_expired():
         if not await proxy.gemini_auth.refresh_if_needed():
@@ -198,7 +199,8 @@ async def call_gemini_streaming(
                         content = candidate.get("content", {})
                         parts = content.get("parts", [])
                         for part in parts:
-                            if part.get("thought") or part.get("thoughtSignature"):
+                            # Skip thought blocks in proxy mode (MCP mode preserves reasoning)
+                            if not _mcp and (part.get("thought") or part.get("thoughtSignature")):
                                 continue
                             text = part.get("text", "")
                             if text:
@@ -221,7 +223,7 @@ async def call_gemini_streaming(
                             inner = event.get("response", event)
                             for candidate in inner.get("candidates", []):
                                 for part in candidate.get("content", {}).get("parts", []):
-                                    if part.get("thought") or part.get("thoughtSignature"):
+                                    if not _mcp and (part.get("thought") or part.get("thoughtSignature")):
                                         continue
                                     text = part.get("text", "")
                                     if text:
