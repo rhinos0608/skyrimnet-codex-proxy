@@ -20,6 +20,7 @@ import asyncio
 import gc
 import json
 import logging
+import signal
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -31,6 +32,27 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 logger = logging.getLogger("mcp_server")
+
+
+def install_signal_handlers(shutdown_event=None):
+    """Install signal handlers to prevent silent process death.
+
+    - Sets SIGPIPE to SIG_IGN so pipe closures raise BrokenPipeError instead
+      of terminating the process silently.
+    - Installs a SIGTERM handler that logs a graceful-shutdown message and,
+      if a shutdown_event is provided, calls shutdown_event.set().
+    """
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+    def _sigterm_handler(signum, frame):
+        logger.info("SIGTERM received — initiating graceful shutdown")
+        if shutdown_event is not None:
+            shutdown_event.set()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
 
 # ---------------------------------------------------------------------------
 # Import everything we need from the main proxy module.  proxy.py declares
@@ -300,6 +322,9 @@ _READONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldH
 _CHAT_ANN = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
 _CLI_ANN = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
 
+# Timeout for individual MCP tool calls (seconds). Matches the aiohttp session timeout.
+MCP_TOOL_TIMEOUT = 300
+
 
 # ---------------------------------------------------------------------------
 # Logged call helper -- wraps a direct provider call with conversation logging
@@ -330,6 +355,24 @@ async def _logged_call(tool_name: str, provider_name: str, model: str,
     if ctx:
         await ctx.report_progress(1, 1)
     return result
+
+
+async def _logged_call_with_timeout(tool_name: str, provider_name: str, model: str,
+                                     call_fn, system_prompt, messages: list,
+                                     max_tokens: int, ctx=None, timeout: float = None,
+                                     **kwargs) -> str:
+    """Wrap _logged_call with an asyncio timeout to prevent indefinite hangs."""
+    if timeout is None:
+        timeout = MCP_TOOL_TIMEOUT
+    try:
+        return await asyncio.wait_for(
+            _logged_call(tool_name, provider_name, model, call_fn, system_prompt, messages,
+                         max_tokens, ctx, **kwargs),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"{tool_name} ({provider_name}/{model}) timed out after {timeout}s")
+        return f"Error: tool call timed out after {timeout}s"
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +678,7 @@ def create_mcp_server() -> FastMCP:
             return "Error: Claude provider is not currently available (auth not ready)."
         m = model or proxy.DEFAULT_MODEL
         try:
-            return await _logged_call("chat_claude", "claude", m, proxy.call_api_direct,
+            return await _logged_call_with_timeout("chat_claude", "claude", m, proxy.call_api_direct,
                                       system_prompt, [{"role": "user", "content": message}], max_tokens, ctx)
         except Exception as e:
             return f"Error calling Claude: {e}"
@@ -651,7 +694,7 @@ def create_mcp_server() -> FastMCP:
             return "Error: OpenRouter provider is not available (API key not configured)."
         kw = {"temperature": temperature} if temperature is not None else {}
         try:
-            return await _logged_call("chat_openrouter", "openrouter", model, proxy.call_openrouter_direct,
+            return await _logged_call_with_timeout("chat_openrouter", "openrouter", model, proxy.call_openrouter_direct,
                                       system_prompt, [{"role": "user", "content": message}], max_tokens, ctx, **kw)
         except Exception as e:
             return f"Error calling OpenRouter: {e}"
@@ -669,7 +712,7 @@ def create_mcp_server() -> FastMCP:
         m = model or _get_ollama_default_model()
         kw = {"temperature": temperature} if temperature is not None else {}
         try:
-            return await _logged_call("chat_ollama", "ollama", m, _call_ollama_smart,
+            return await _logged_call_with_timeout("chat_ollama", "ollama", m, _call_ollama_smart,
                                       system_prompt, [{"role": "user", "content": message}], max_tokens, ctx, **kw)
         except Exception as e:
             return f"Error calling Ollama: {e}"
@@ -684,7 +727,7 @@ def create_mcp_server() -> FastMCP:
         if not _is_antigravity_healthy():
             return "Error: Antigravity provider is not available (auth not ready)."
         try:
-            return await _logged_call("chat_antigravity", "antigravity", model, proxy.call_antigravity_direct,
+            return await _logged_call_with_timeout("chat_antigravity", "antigravity", model, proxy.call_antigravity_direct,
                                       system_prompt, [{"role": "user", "content": message}], max_tokens, ctx)
         except Exception as e:
             return f"Error calling Antigravity: {e}"
@@ -699,7 +742,7 @@ def create_mcp_server() -> FastMCP:
             return "Error: Z.AI provider is not available (API key not configured)."
         kw = {"temperature": temperature} if temperature is not None else {}
         try:
-            return await _logged_call("chat_zai", "zai", model, proxy.call_zai_direct,
+            return await _logged_call_with_timeout("chat_zai", "zai", model, proxy.call_zai_direct,
                                       system_prompt, [{"role": "user", "content": message}], max_tokens, ctx, **kw)
         except Exception as e:
             return f"Error calling Z.AI: {e}"
@@ -714,7 +757,7 @@ def create_mcp_server() -> FastMCP:
             return "Error: Xiaomi provider is not available (API key not configured)."
         kw = {"temperature": temperature} if temperature is not None else {}
         try:
-            return await _logged_call("chat_xiaomi", "xiaomi", model, proxy.call_xiaomi_direct,
+            return await _logged_call_with_timeout("chat_xiaomi", "xiaomi", model, proxy.call_xiaomi_direct,
                                       system_prompt, [{"role": "user", "content": message}], max_tokens, ctx, **kw)
         except Exception as e:
             return f"Error calling Xiaomi: {e}"
@@ -737,7 +780,7 @@ def create_mcp_server() -> FastMCP:
         try:
             if ctx:
                 await ctx.info("Starting Codex CLI task...")
-            return await _logged_call("cli_codex", "codex_cli", m, proxy.call_codex_direct,
+            return await _logged_call_with_timeout("cli_codex", "codex_cli", m, proxy.call_codex_direct,
                                       system_prompt, [{"role": "user", "content": task}], max_tokens, ctx)
         except Exception as e:
             return f"Error calling Codex CLI: {e}"
@@ -754,7 +797,7 @@ def create_mcp_server() -> FastMCP:
         try:
             if ctx:
                 await ctx.info("Starting Gemini CLI task...")
-            return await _logged_call("cli_gemini", "gemini_cli", model, proxy.call_gemini_direct,
+            return await _logged_call_with_timeout("cli_gemini", "gemini_cli", model, proxy.call_gemini_direct,
                                       system_prompt, [{"role": "user", "content": task}], max_tokens, ctx)
         except Exception as e:
             return f"Error calling Gemini CLI: {e}"
@@ -772,7 +815,7 @@ def create_mcp_server() -> FastMCP:
         try:
             if ctx:
                 await ctx.info("Starting Qwen CLI task...")
-            return await _logged_call("cli_qwen", "qwen_cli", model, proxy.call_qwen_direct,
+            return await _logged_call_with_timeout("cli_qwen", "qwen_cli", model, proxy.call_qwen_direct,
                                       system_prompt, [{"role": "user", "content": task}], max_tokens, ctx, **kw)
         except Exception as e:
             return f"Error calling Qwen CLI: {e}"
@@ -789,7 +832,7 @@ def create_mcp_server() -> FastMCP:
         try:
             if ctx:
                 await ctx.info("Starting OpenCode Zen task...")
-            return await _logged_call("cli_opencode_zen", "opencode_zen", model, proxy.call_opencode_direct,
+            return await _logged_call_with_timeout("cli_opencode_zen", "opencode_zen", model, proxy.call_opencode_direct,
                                       system_prompt, [{"role": "user", "content": task}], max_tokens, ctx, **kw)
         except Exception as e:
             return f"Error calling OpenCode Zen: {e}"
@@ -806,7 +849,7 @@ def create_mcp_server() -> FastMCP:
         try:
             if ctx:
                 await ctx.info("Starting OpenCode Go task...")
-            return await _logged_call("cli_opencode_go", "opencode_go", model, proxy.call_opencode_direct,
+            return await _logged_call_with_timeout("cli_opencode_go", "opencode_go", model, proxy.call_opencode_direct,
                                       system_prompt, [{"role": "user", "content": task}], max_tokens, ctx, **kw)
         except Exception as e:
             return f"Error calling OpenCode Go: {e}"
@@ -868,11 +911,17 @@ def create_mcp_server() -> FastMCP:
         try:
             if ctx:
                 await ctx.report_progress(0, 1)
-            sr = await call_with_fallback(fallback_providers, system_prompt, messages,
-                                          use_model, max_tokens, **kwargs)
+            sr = await asyncio.wait_for(
+                call_with_fallback(fallback_providers, system_prompt, messages,
+                                   use_model, max_tokens, **kwargs),
+                timeout=MCP_TOOL_TIMEOUT,
+            )
             if ctx:
                 await ctx.report_progress(1, 1)
             return sr.full
+        except asyncio.TimeoutError:
+            logger.warning(f"chat tool timed out after {MCP_TOOL_TIMEOUT}s (provider={provider or 'auto'})")
+            return f"Error: chat tool timed out after {MCP_TOOL_TIMEOUT}s"
         except Exception as e:
             if provider:
                 return f"Error calling {provider}: {e}"
@@ -926,11 +975,17 @@ def create_mcp_server() -> FastMCP:
             if ctx:
                 await ctx.info(f"Starting {target['name']} task...")
                 await ctx.report_progress(0, 1)
-            sr = await call_with_fallback(fallback_providers, system_prompt, messages,
-                                          use_model, max_tokens)
+            sr = await asyncio.wait_for(
+                call_with_fallback(fallback_providers, system_prompt, messages,
+                                   use_model, max_tokens),
+                timeout=MCP_TOOL_TIMEOUT,
+            )
             if ctx:
                 await ctx.report_progress(1, 1)
             return sr.full
+        except asyncio.TimeoutError:
+            logger.warning(f"cli tool timed out after {MCP_TOOL_TIMEOUT}s (provider={provider or 'auto'})")
+            return f"Error: cli tool timed out after {MCP_TOOL_TIMEOUT}s"
         except Exception as e:
             if provider:
                 return f"Error calling {provider}: {e}"
@@ -1119,7 +1174,14 @@ def create_mcp_server() -> FastMCP:
 
         if summarize:
             chat_providers = get_healthy_chat_providers()
-            result = await search_and_summarize(query, providers=chat_providers, count=count)
+            try:
+                result = await asyncio.wait_for(
+                    search_and_summarize(query, providers=chat_providers, count=count),
+                    timeout=MCP_TOOL_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"web_search timed out after {MCP_TOOL_TIMEOUT}s (query={query!r})")
+                return f"Error: web_search timed out after {MCP_TOOL_TIMEOUT}s"
 
             if ctx:
                 await ctx.report_progress(2, 2)
@@ -1237,6 +1299,7 @@ def run_mcp_server(transport: str = "stdio"):
         transport: "stdio" for Claude Desktop / CLI integration (default),
                    "sse" for HTTP SSE on port 8432.
     """
+    install_signal_handlers()
     server = create_mcp_server()
     if transport == "sse":
         port = server.settings.port
