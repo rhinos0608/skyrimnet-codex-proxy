@@ -26,6 +26,7 @@ SkyrimNet (game) --> POST /v1/chat/completions --> Proxy (port 8000) --> Anthrop
 - **Persistent TCP/TLS session** reused across all requests
 - **Tool definitions stripped** from template (saves ~60KB per request)
 - **Extended thinking disabled** to minimize latency
+- **Hidden reasoning scrubbed from streamed output** so upstream chain-of-thought never reaches SkyrimNet clients
 - **Clean temp directory capture** minimizes template bloat (~1KB vs ~16KB)
 - **Isolated Codex HOME** prevents config/instruction bloat
 
@@ -84,6 +85,8 @@ In your SkyrimNet configuration, set:
 - **API Endpoint**: `http://localhost:8000/v1/chat/completions`
 - **API Key**: (leave empty or set any value — not required)
 - **Model**: `claude-sonnet-4-5-20250929` (recommended), `gpt-5.2-codex`, or any supported model
+
+Top-level control params such as `reasoning` and `thinking` are accepted on `/v1/chat/completions` and passed through to provider-specific fixups where supported. For streaming OpenAI-compatible upstreams, any hidden reasoning deltas are scrubbed before the proxy emits SSE to the client; if an upstream produces reasoning without visible text, the proxy will attempt a short rewrite into normal dialogue and otherwise fail closed rather than leaking the raw trace.
 
 ### Supported Models
 
