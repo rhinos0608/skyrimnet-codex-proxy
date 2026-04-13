@@ -113,11 +113,15 @@ async def passthrough_sse(resp, request_id: str, provider_name: str, start: floa
     In MCP mode: passes events through verbatim (reasoning preserved for general-purpose callers).
     """
     import proxy as _proxy
+    # Snapshot at stream start; mid-stream toggles take effect on next request
     _mcp = getattr(_proxy, "MCP_MODE", False)
+    _override = getattr(_proxy, "reasoning_override_enabled", False)
+    _skip_scrub = _mcp or _override
 
     buffer = bytearray()
     total_content = 0
     warned_reasoning_drop = False
+    logged_override_passthrough = False
 
     async for raw_chunk in resp.content.iter_any():
         buffer.extend(raw_chunk)
@@ -127,9 +131,12 @@ async def passthrough_sse(resp, request_id: str, provider_name: str, start: floa
                 break
             event_bytes = bytes(buffer[:idx]).strip()
             del buffer[:idx + 2]
-            if _mcp:
+            if _skip_scrub:
                 emitted = event_bytes.decode("utf-8", errors="replace").strip() + "\n\n" if event_bytes else None
                 reasoning_text = None
+                if _override and not logged_override_passthrough and event_bytes and b'"reasoning' in event_bytes:
+                    logged_override_passthrough = True
+                    logger.info(f"[{request_id}] thinking tokens being passed through due to dashboard reasoning override")
             else:
                 emitted, reasoning_text = _scrub_event(event_bytes)
             if reasoning_text and not warned_reasoning_drop:
@@ -142,9 +149,12 @@ async def passthrough_sse(resp, request_id: str, provider_name: str, start: floa
 
     if buffer.strip():
         event_bytes = bytes(buffer).strip()
-        if _mcp:
+        if _skip_scrub:
             emitted = event_bytes.decode("utf-8", errors="replace").strip() + "\n\n"
             reasoning_text = None
+            if _override and not logged_override_passthrough and b'"reasoning' in event_bytes:
+                logged_override_passthrough = True
+                logger.info(f"[{request_id}] thinking tokens being passed through due to dashboard reasoning override")
         else:
             emitted, reasoning_text = _scrub_event(event_bytes)
         if reasoning_text and not warned_reasoning_drop:

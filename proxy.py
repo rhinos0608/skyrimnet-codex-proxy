@@ -484,7 +484,7 @@ def _passthrough_sse_dispatch(resp, request_id, provider_name, start, **kw):
     """Dispatch to rewrite-aware passthrough when rewrite context is set, otherwise original.
     In MCP mode, always use the original passthrough (no NPC dialogue rewrite)."""
     ctx = _rewrite_ctx.get()
-    if not MCP_MODE and reasoning_rewrite_enabled and ctx:
+    if not MCP_MODE and not reasoning_override_enabled and reasoning_rewrite_enabled and ctx:
         return passthrough_sse_with_rewrite(
             resp, request_id, provider_name, start,
             system_prompt=ctx.get("system_prompt"),
