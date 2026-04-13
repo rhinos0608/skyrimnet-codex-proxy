@@ -27,7 +27,7 @@ _FIREWORKS_MODEL_ALIASES: dict[str, str] = {
 }
 
 
-_FIREWORKS_UNSUPPORTED_PARAMS = {"reasoning", "top_k", "provider"}
+_FIREWORKS_UNSUPPORTED_PARAMS = {"reasoning", "thinking", "top_k", "provider"}
 
 
 def _resolve_fireworks_model(model: str) -> str:
@@ -39,20 +39,26 @@ def _resolve_fireworks_model(model: str) -> str:
 def _fireworks_payload_fixup(payload: dict, extra_params: dict) -> None:
     """Apply Fireworks-specific payload adjustments.
 
-    - Strips unsupported params (reasoning, top_k, provider).
-    - When the caller sends reasoning.enabled=false, disables thinking via the
-      Anthropic-compatible thinking param to prevent chain-of-thought leaking
-      into the content stream.
+    - Strips unsupported params (reasoning, thinking, top_k, provider).
+      Fireworks rejects requests that specify both 'thinking' and
+      'reasoning_effort', so 'thinking' is always stripped and
+      'reasoning_effort' is the canonical signal.
+    - When the caller sends reasoning.enabled=false (and no reasoning_effort),
+      disables thinking via the Anthropic-compatible thinking param to prevent
+      chain-of-thought leaking into the content stream.
     """
     payload.update({k: v for k, v in extra_params.items()
                     if v is not None and k not in _FIREWORKS_UNSUPPORTED_PARAMS})
-    thinking = extra_params.get("thinking")
-    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        payload["thinking"] = {"type": "disabled"}
-    # Translate OpenAI-style reasoning param to Fireworks thinking param
-    reasoning = extra_params.get("reasoning")
-    if isinstance(reasoning, dict) and not reasoning.get("enabled", True):
-        payload["thinking"] = {"type": "disabled"}
+    # Only inject thinking=disabled when reasoning_effort is absent — the two
+    # fields are mutually exclusive on Fireworks.
+    if "reasoning_effort" not in payload:
+        thinking = extra_params.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+            payload["thinking"] = {"type": "disabled"}
+        # Translate OpenAI-style reasoning param to Fireworks thinking param
+        reasoning = extra_params.get("reasoning")
+        if isinstance(reasoning, dict) and not reasoning.get("enabled", True):
+            payload["thinking"] = {"type": "disabled"}
 
 
 async def _call_fireworks_direct_via_streaming(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params) -> str:
