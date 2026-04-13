@@ -1,11 +1,37 @@
 """Tailscale HTTPS reverse-proxy helper (optional)."""
 
+import json as _json
 import logging
 import shutil
 import subprocess
-from typing import Iterable
+from typing import Iterable, Optional
 
 logger = logging.getLogger("proxy")
+
+
+def get_tailscale_fqdn() -> Optional[str]:
+    """Return this machine's Tailscale FQDN (e.g. ``myhost.tailnet123.ts.net``).
+
+    Returns ``None`` when the CLI is missing, Tailscale is not running, or the
+    FQDN cannot be determined.
+    """
+    if not shutil.which("tailscale"):
+        return None
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return (
+                _json.loads(result.stdout)
+                .get("Self", {})
+                .get("DNSName", "")
+                .rstrip(".") or None
+            )
+    except Exception as exc:
+        logger.debug(f"tailscale FQDN lookup failed: {exc}")
+    return None
 
 
 def _setup_tailscale_serve(ports: list[int]):
@@ -15,30 +41,9 @@ def _setup_tailscale_serve(ports: list[int]):
     Tailscale FQDN.  Requires Tailscale to be running and `tailscale serve`
     to be available (MagicDNS + HTTPS enabled on the tailnet).
     """
-    import shutil
-    import subprocess
-
-    if not shutil.which("tailscale"):
-        logger.warning("tailscale CLI not found — skipping HTTPS setup")
-        return
-
-    # Get this machine's Tailscale FQDN
-    try:
-        result = subprocess.run(
-            ["tailscale", "status", "--json"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0:
-            logger.warning("tailscale status failed — is Tailscale running?")
-            return
-        import json as _json
-        ts_status = _json.loads(result.stdout)
-        fqdn = ts_status.get("Self", {}).get("DNSName", "").rstrip(".")
-        if not fqdn:
-            logger.warning("Could not determine Tailscale FQDN")
-            return
-    except Exception as e:
-        logger.warning(f"Failed to query Tailscale status: {e}")
+    fqdn = get_tailscale_fqdn()
+    if not fqdn:
+        logger.warning("Could not determine Tailscale FQDN — skipping HTTPS setup")
         return
 
     for port in ports:

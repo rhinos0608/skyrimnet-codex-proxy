@@ -207,7 +207,7 @@ from proxy_internal.interceptors import (
     start_codex_interceptor,
     load_opencode_key,
 )
-from proxy_internal.tailscale import _setup_tailscale_serve
+from proxy_internal.tailscale import _setup_tailscale_serve, get_tailscale_fqdn
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
@@ -1413,16 +1413,24 @@ async def lifespan(app):
     if codex_runner:
         await codex_runner.cleanup()
 
+# Build CORS origins — localhost always, plus Tailscale FQDN if available
+_cors_origins = [
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:8539",
+    "http://127.0.0.1:8539",
+    "http://localhost:8432",
+    "http://127.0.0.1:8432",
+]
+_ts_fqdn = get_tailscale_fqdn()
+if _ts_fqdn:
+    for _port in (8000, 8539, 8432):
+        _cors_origins.append(f"https://{_ts_fqdn}:{_port}")
+    logger.info(f"Tailscale CORS origins added for {_ts_fqdn}")
+
 app = FastAPI(title="Claude SkyrimNet Proxy", lifespan=lifespan)
 app.add_middleware(CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "http://localhost:8539",
-        "http://127.0.0.1:8539",
-        "http://localhost:8432",
-        "http://127.0.0.1:8432",
-    ],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"])
 
