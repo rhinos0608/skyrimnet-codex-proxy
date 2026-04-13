@@ -322,7 +322,7 @@ class TestStreamingTranslator:
         assert "lo" in joined
         assert "event: content_block_stop" in joined
         assert "event: message_delta" in joined
-        assert '"stop_reason":"end_turn"' in joined
+        assert '"stop_reason": "end_turn"' in joined or '"stop_reason":"end_turn"' in joined
         assert "event: message_stop" in joined
 
     @pytest.mark.asyncio
@@ -338,7 +338,7 @@ class TestStreamingTranslator:
         ):
             events.append(chunk)
         joined = _join_events(events)
-        assert '"stop_reason":"max_tokens"' in joined
+        assert '"stop_reason": "max_tokens"' in joined or '"stop_reason":"max_tokens"' in joined
 
     @pytest.mark.asyncio
     async def test_raw_error_chunk_surfaces_as_text_delta(self, proxy_module):
