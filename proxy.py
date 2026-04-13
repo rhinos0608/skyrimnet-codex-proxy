@@ -1191,8 +1191,9 @@ async def _with_timeout_routing(
                     except Exception:
                         pass
                     model_stats.record(fb_model, time.time() - fb_start, success=False)
+                    err_msg = str(e) or type(e).__name__
                     logger.error(
-                        f"[timeout-routing] fallback {fb_model} errored before first token: {e} — trying next candidate"
+                        f"[timeout-routing] fallback {fb_model} errored before first token: {err_msg} — trying next candidate"
                     )
                     continue
 
@@ -1227,8 +1228,9 @@ async def _with_timeout_routing(
                         ):
                             yield c
                     except Exception as e:
+                        err_msg = str(e) or type(e).__name__
                         logger.error(
-                            f"[timeout-routing] fallback {fb_model} errored mid-stream: {e}"
+                            f"[timeout-routing] fallback {fb_model} errored mid-stream: {err_msg}"
                         )
                         # Content already flowing to the client — can't re-route
                         # mid-stream, but we must close cleanly or the game retries.
@@ -2340,8 +2342,9 @@ async def _call_oai_compatible_direct(resolved: dict, payload: dict, request_id:
     except HTTPException:
         raise
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        logger.error(f"[{request_id}] {provider} structured direct error: {e}")
-        raise HTTPException(status_code=502, detail=f"{provider} error: {e}")
+        err_msg = str(e) or type(e).__name__
+        logger.error(f"[{request_id}] {provider} structured direct error: {err_msg}")
+        raise HTTPException(status_code=502, detail=f"{provider} error: {err_msg}")
     finally:
         if resolved.get("owns_session"):
             try:
@@ -2419,8 +2422,9 @@ async def _stream_oai_compatible(resolved: dict, payload: dict, request_id: str)
     except HTTPException:
         raise
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        logger.error(f"[{request_id}] {provider} stream error: {e}")
-        raise HTTPException(status_code=502, detail=f"{provider} stream error: {e}")
+        err_msg = str(e) or type(e).__name__
+        logger.error(f"[{request_id}] {provider} stream error: {err_msg}")
+        raise HTTPException(status_code=502, detail=f"{provider} stream error: {err_msg}")
     finally:
         if resolved.get("owns_session"):
             try:
