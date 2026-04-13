@@ -20,7 +20,7 @@ from proxy_internal.sse_utils import yield_sse_error
 logger = logging.getLogger("proxy")
 
 
-_OLLAMA_UNSUPPORTED_PARAMS = {"top_k", "thinking", "reasoning"}
+_OLLAMA_UNSUPPORTED_PARAMS = {"top_k", "thinking", "reasoning", "reasoning_effort"}
 
 _reasoning_strip_warned = False
 
@@ -38,8 +38,9 @@ def _ollama_payload_fixup(payload: dict, extra_params: dict) -> None:
     if not _reasoning_strip_warned and proxy.reasoning_override_enabled:
         _reasoning_strip_warned = True
         logger.info(
-            "Reasoning override active — 'thinking' param stripped for Ollama "
-            "(upstream does not support it); 'reasoning_effort' forwarded"
+            "Reasoning override active — thinking-related params "
+            "(thinking, reasoning, reasoning_effort) stripped for Ollama "
+            "(upstream does not support them)"
         )
     payload.update({
         k: v for k, v in extra_params.items()
@@ -84,6 +85,7 @@ async def call_ollama_direct(system_prompt: Optional[str], messages: list, model
                     raise HTTPException(status_code=resp.status, detail=error_body[:200])
                 data = await resp.json()
                 text = _extract_oai_content(data["choices"][0]["message"])
+                retry_data = None
                 if text is None and _has_reasoning_without_content(data):
                     retry_payload = dict(payload)
                     retry_payload.pop("max_tokens", None)
@@ -98,6 +100,16 @@ async def call_ollama_direct(system_prompt: Optional[str], messages: list, model
                         retry_data = await retry_resp.json()
                         text = _extract_oai_content(retry_data["choices"][0]["message"])
                 if text is None:
+                    # Check if reasoning was present (in original or retry response)
+                    had_reasoning = _has_reasoning_without_content(data)
+                    if not had_reasoning and retry_data is not None:
+                        had_reasoning = _has_reasoning_without_content(retry_data)
+                    if had_reasoning:
+                        logger.warning(f"[{request_id}] Ollama produced reasoning tokens but no content after retry")
+                        raise HTTPException(
+                            status_code=502,
+                            detail="Ollama returned reasoning tokens but no content (model may not support content generation with reasoning enabled)",
+                        )
                     raise HTTPException(status_code=502, detail="Ollama returned no content")
                 return text
         except aiohttp.ClientConnectorError:

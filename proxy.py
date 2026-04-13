@@ -2310,7 +2310,74 @@ def _anthropic_to_oai_structured(body: dict) -> dict:
     if body.get("stream"):
         payload["stream"] = True
 
+    # --- Reasoning / thinking translation for OAI-compatible providers ---
+    # OAI providers understand ``reasoning_effort`` but NOT Anthropic's
+    # ``thinking`` dict, so we translate rather than forward verbatim.
+    if reasoning_override_enabled:
+        # Dashboard override is active — inject the configured level.
+        payload["reasoning_effort"] = reasoning_override_level
+    else:
+        # Check if the caller sent Anthropic-style ``thinking`` with
+        # ``type: "enabled"`` and translate the budget into an effort level.
+        caller_thinking = body.get("thinking")
+        if isinstance(caller_thinking, dict) and caller_thinking.get("type") == "enabled":
+            # Anthropic budget_tokens: <=4K→low, <=16K→medium, >16K→high
+            budget = caller_thinking.get("budget_tokens")
+            if budget is not None:
+                if budget <= 4096:
+                    payload["reasoning_effort"] = "low"
+                elif budget <= 16384:
+                    payload["reasoning_effort"] = "medium"
+                else:
+                    payload["reasoning_effort"] = "high"
+
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Provider-specific payload fixup for the structured (OAI-compatible) path
+# ---------------------------------------------------------------------------
+
+# Fields that no OAI-compatible provider supports (Anthropic-style dicts).
+_STRUCTURED_ALWAYS_STRIP = {"thinking", "reasoning"}
+
+# Extra fields that specific providers reject on top of the always-strip set.
+# NOTE: ``provider`` is intentionally only stripped for Fireworks/NVIDIA, not
+# universally, because OpenRouter uses it for routing preferences.
+_STRUCTURED_PROVIDER_STRIP: dict[str, set[str]] = {
+    "Ollama":       {"top_k", "reasoning_effort"},
+    "Fireworks":    {"top_k", "provider"},
+    "NVIDIA NIM":   {"top_k", "provider"},
+}
+
+
+def _structured_payload_fixup(payload: dict, provider_name: str) -> None:
+    """Strip fields that the target provider does not support.
+
+    Called in-place on *send_payload* right before the HTTP call in both
+    ``_call_oai_compatible_direct`` and ``_stream_oai_compatible``.
+
+    Every OAI-compatible provider rejects Anthropic-style ``thinking`` and
+    ``reasoning`` dicts, so those are always removed.  Provider-specific
+    extras (``top_k``, ``provider``) are stripped according to
+    ``_STRUCTURED_PROVIDER_STRIP``.
+    """
+    # Capture Anthropic-style thinking/reasoning before stripping so we can
+    # conditionally re-inject for providers that support a "disabled" toggle.
+    orig_thinking = payload.get("thinking")
+    orig_reasoning = payload.get("reasoning")
+
+    to_strip = _STRUCTURED_ALWAYS_STRIP | _STRUCTURED_PROVIDER_STRIP.get(provider_name, set())
+    for key in to_strip:
+        payload.pop(key, None)
+
+    # Fireworks: re-inject thinking=disabled when the caller explicitly
+    # requested it and no reasoning_effort is present to take precedence.
+    if provider_name == "Fireworks" and "reasoning_effort" not in payload:
+        if isinstance(orig_thinking, dict) and orig_thinking.get("type") == "disabled":
+            payload["thinking"] = {"type": "disabled"}
+        elif isinstance(orig_reasoning, dict) and not orig_reasoning.get("enabled", True):
+            payload["thinking"] = {"type": "disabled"}
 
 
 async def _call_oai_compatible_direct(resolved: dict, payload: dict, request_id: str) -> dict:
@@ -2327,6 +2394,7 @@ async def _call_oai_compatible_direct(resolved: dict, payload: dict, request_id:
     send_payload = dict(payload)
     send_payload["model"] = resolved["api_model"]
     send_payload.pop("stream", None)
+    _structured_payload_fixup(send_payload, provider)
 
     logger.info(
         f"[{request_id}] -> {provider} structured direct "
@@ -2370,6 +2438,7 @@ async def _stream_oai_compatible(resolved: dict, payload: dict, request_id: str)
     send_payload = dict(payload)
     send_payload["model"] = resolved["api_model"]
     send_payload["stream"] = True
+    _structured_payload_fixup(send_payload, provider)
 
     logger.info(
         f"[{request_id}] -> {provider} structured stream "
